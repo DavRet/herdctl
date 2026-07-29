@@ -1,17 +1,17 @@
 ---
-last_updated: 2026-03-06T00:00:00Z
+last_updated: 2026-07-29T00:00:00Z
 last_mapping: 2026-02-14
-last_audit: 2026-03-06
+last_audit: 2026-07-29
 commits_since_audit: 0
-commits_since_mapping: 111
+commits_since_mapping: 245
 open_findings: 8
-open_questions: 8
-status: audit_complete_yellow
+open_questions: 4
+status: audit_complete_green
 ---
 
 # Security Audit State
 
-**Last Updated:** 2026-02-20 00:00 UTC
+**Last Updated:** 2026-07-29 00:00 UTC
 
 This document provides persistent state for security audits, enabling incremental reviews that build on previous work rather than starting fresh each time.
 
@@ -22,12 +22,12 @@ This document provides persistent state for security audits, enabling incrementa
 | Metric | Value | Notes |
 |--------|-------|-------|
 | Last full mapping | 2026-02-14 | Comprehensive audit completed |
-| Last incremental audit | 2026-03-06 | Incremental - YELLOW - 1 new HIGH finding (#012 Web API) |
-| Commits since last audit | 0 | At 5f79021 (2026-03-06) |
+| Last incremental audit | 2026-07-29 | Incremental - GREEN - Significant security improvements, 0 new findings |
+| Commits since last audit | 0 | At 187fef8 (2026-07-29) |
 | Open findings | 8 | See [FINDINGS-INDEX.md](intel/FINDINGS-INDEX.md) |
-| Open questions | 8 | Q1, Q3, Q4, Q5, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14 (3 answered) |
+| Open questions | 4 | Q1, Q4, Q5, Q8 (others answered) |
 
-**Status:** YELLOW - Finding #012 (Web API lacks authentication) needs documentation; Finding #011 risk elevated.
+**Status:** GREEN - 5 security fixes deployed (1 CRITICAL, 1 HIGH, 2 MEDIUM, 1 LOW). No new concerns.
 
 ### Finding Breakdown
 
@@ -52,12 +52,12 @@ Security coverage by area with staleness tracking.
 
 | Area | Last Checked | Commits Since | Status | Notes |
 |------|--------------|---------------|--------|-------|
-| Attack surface | 2026-03-06 | 0 | ✅ Current | Agent distribution + session discovery analyzed |
-| Data flows | 2026-03-06 | 0 | ✅ Current | Web API flows traced, OAuth paths reviewed |
-| Security controls | 2026-03-06 | 0 | ✅ Current | Path validation + shell escaping verified |
-| Threat vectors | 2026-03-06 | 0 | ✅ Current | SSRF, traversal, unauth access assessed |
-| Hot spots | 2026-03-06 | 0 | ✅ Current | Scanner run complete - 4422ms |
-| Code patterns | 2026-03-06 | 0 | ✅ Current | buildSafeFilePath usage verified |
+| Attack surface | 2026-07-29 | 0 | ✅ Current | File serving endpoint analyzed |
+| Data flows | 2026-07-29 | 0 | ✅ Current | OAuth credential injection paths verified |
+| Security controls | 2026-07-29 | 0 | ✅ Current | Cross-platform path validation confirmed |
+| Threat vectors | 2026-07-29 | 0 | ✅ Current | Permission bypass, traversal, collisions assessed |
+| Hot spots | 2026-07-29 | 0 | ✅ Current | Scanner run complete - 5798ms |
+| Code patterns | 2026-07-29 | 0 | ✅ Current | Tool permission enforcement verified |
 
 ### Staleness Thresholds
 
@@ -135,10 +135,10 @@ Security capabilities not yet implemented or areas needing investigation:
 
 ### Session Continuity
 
-- **Last session:** 2026-03-06 - Incremental audit covering 71 commits
-- **Completed:** Scanner run (FAIL - no regressions), change analysis (distribution + session discovery), web API auth review, agent name validation, encodedPath analysis, #012 discovery
-- **Resume from:** Normal operations; next scheduled audit ~2026-03-13
-- **Next priority:** Document web dashboard security model (#012), audit session files for credential leaks (#011), encodedPath validation (Q13)
+- **Last session:** 2026-07-29 - Incremental audit covering 134 commits
+- **Completed:** Scanner run (FAIL - no regressions), change analysis (5 security fixes), file serving security review, tool permission bypass verification, cross-platform path traversal fix confirmation
+- **Resume from:** Normal operations; next scheduled audit ~2026-08-05
+- **Next priority:** Monitor npm audit updates (#008), review Renovate activity, file serving endpoint production testing, Finding #012 documentation
 
 ---
 
