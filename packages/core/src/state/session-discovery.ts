@@ -33,7 +33,7 @@ import {
   AttributionIndexBuilder,
   type SessionOrigin,
 } from "./session-attribution.js";
-import { SessionMetadataStore } from "./session-metadata.js";
+import { isSessionMetadataUnreadableError, SessionMetadataStore } from "./session-metadata.js";
 import { mapWithConcurrency } from "./utils/concurrency.js";
 
 // =============================================================================
@@ -722,17 +722,51 @@ export class SessionDiscoveryService {
     }
 
     // Batch write any cache updates
-    if (autoNameUpdates.length > 0) {
-      await this.sessionMetadataStore.batchSetAutoNames(agentName, autoNameUpdates);
-    }
-    if (previewUpdates.length > 0) {
-      await this.sessionMetadataStore.batchSetPreviews(agentName, previewUpdates);
-    }
-    if (sidechainUpdates.length > 0) {
-      await this.sessionMetadataStore.batchSetSidechains(agentName, sidechainUpdates);
-    }
+    await this.persistCacheUpdates(async () => {
+      if (autoNameUpdates.length > 0) {
+        await this.sessionMetadataStore.batchSetAutoNames(agentName, autoNameUpdates);
+      }
+      if (previewUpdates.length > 0) {
+        await this.sessionMetadataStore.batchSetPreviews(agentName, previewUpdates);
+      }
+      if (sidechainUpdates.length > 0) {
+        await this.sessionMetadataStore.batchSetSidechains(agentName, sidechainUpdates);
+      }
+    });
 
     return sessions;
+  }
+
+  /**
+   * Persist enrichment cache updates, tolerating a refusal to overwrite an
+   * unreadable/corrupt metadata file (issue #419).
+   *
+   * These writes only warm derived caches (autoName / preview / sidechain /
+   * usage) — never user data. A poisoned metadata file for one agent must not
+   * abort a whole listing, so a {@link SessionMetadataUnreadableError} is logged
+   * and swallowed: the cache simply stays cold and the next listing re-extracts.
+   * The store leaves the damaged file untouched, so nothing is lost. Any other
+   * error (e.g. a genuine write failure) still propagates unchanged.
+   *
+   * Composition with #424's per-entry guard: this wraps the batch writes that
+   * run AFTER the per-entry enrichment loop, so it sits downstream of the
+   * `try/catch` around {@link enrichAgentSession} (and the equivalent per-entry
+   * catch in `getAllSessions`). Those guards only wrap *reads*; the writes that
+   * throw `SessionMetadataUnreadableError` live out here, so the refusal reaches
+   * this handler instead of being mislabelled as a skipped read entry.
+   */
+  private async persistCacheUpdates(writes: () => Promise<void>): Promise<void> {
+    try {
+      await writes();
+    } catch (error) {
+      if (isSessionMetadataUnreadableError(error)) {
+        logger.warn(
+          `Skipping session-metadata cache update for "${error.agentName}": ${error.message}`,
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1193,15 +1227,17 @@ export class SessionDiscoveryService {
       }
 
       // Batch write any cache updates for this directory
-      if (autoNameUpdates.length > 0) {
-        await this.sessionMetadataStore.batchSetAutoNames(dir.metadataKey, autoNameUpdates);
-      }
-      if (previewUpdates.length > 0) {
-        await this.sessionMetadataStore.batchSetPreviews(dir.metadataKey, previewUpdates);
-      }
-      if (sidechainUpdates.length > 0) {
-        await this.sessionMetadataStore.batchSetSidechains(dir.metadataKey, sidechainUpdates);
-      }
+      await this.persistCacheUpdates(async () => {
+        if (autoNameUpdates.length > 0) {
+          await this.sessionMetadataStore.batchSetAutoNames(dir.metadataKey, autoNameUpdates);
+        }
+        if (previewUpdates.length > 0) {
+          await this.sessionMetadataStore.batchSetPreviews(dir.metadataKey, previewUpdates);
+        }
+        if (sidechainUpdates.length > 0) {
+          await this.sessionMetadataStore.batchSetSidechains(dir.metadataKey, sidechainUpdates);
+        }
+      });
 
       if (sessions.length > 0) {
         groups.push({
@@ -1379,7 +1415,9 @@ export class SessionDiscoveryService {
     }
 
     const usage = await extractSessionUsage(filePath);
-    await this.sessionMetadataStore.setUsage(agentName, sessionId, usage, mtimeStr);
+    await this.persistCacheUpdates(() =>
+      this.sessionMetadataStore.setUsage(agentName, sessionId, usage, mtimeStr),
+    );
     return usage;
   }
 
