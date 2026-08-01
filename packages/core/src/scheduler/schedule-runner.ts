@@ -67,6 +67,11 @@ export interface RunScheduleOptions {
   scheduleState: ScheduleState;
   /** Path to the state directory (e.g., .herdctl) */
   stateDir: string;
+  /**
+   * Claude home directory used to resolve native CLI transcript paths.
+   * Defaults to `~/.claude`; only the `cli` runtime consumes it (herdctl#423).
+   */
+  claudeHomePath?: string;
   /** Optional work source manager for fetching work items */
   workSourceManager?: WorkSourceManager;
   /** Optional logger */
@@ -237,6 +242,7 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
     scheduleName,
     schedule,
     stateDir,
+    claudeHomePath,
     workSourceManager,
     logger = defaultLogger,
     executorOptions,
@@ -317,6 +323,11 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
           timeout: sessionTimeout,
           logger,
           runtime: agent.runtime ?? "sdk",
+          // The `cli` runtime checks the transcript exists on disk, so that check
+          // must use the configured home; otherwise a non-default home makes a
+          // valid session look missing — and it is CLEARED, not just skipped
+          // (herdctl#423).
+          claudeHomePath,
         });
         if (existingSession?.session_id) {
           sessionId = existingSession.session_id;
@@ -335,7 +346,7 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
     }
 
     // Step 6: Execute the agent via JobExecutor
-    const runtime = RuntimeFactory.create(agent, { stateDir });
+    const runtime = RuntimeFactory.create(agent, { stateDir, claudeHomePath });
     const executor = new JobExecutor(runtime, executorOptions);
 
     const runnerResult = await executor.execute({
