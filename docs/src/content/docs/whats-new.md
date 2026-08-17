@@ -7,6 +7,99 @@ A summary of notable changes across the herdctl packages. For the full technical
 
 ---
 
+## August 17, 2026
+
+### Job Listing Performance Improvements
+**July 28, 2026** · `@herdctl/core@5.27.0`
+
+**core** listJobs now uses an indexed approach for filtering and pagination, dramatically improving performance when working with large job histories. Previously, every job file was parsed before filters were applied. Now, filtering by agent and status happens against a lightweight index, and only the matching records are fully parsed. On a directory with ~2000 jobs, listing one agent's jobs improved from 1.1s to 141ms, and paginated queries (limit: 50) dropped from 1.1s to 31ms. The index is validated against file mtime on every call, so results stay fresh without explicit invalidation. ListJobsFilter gains `limit` and `offset` parameters for server-side pagination. [#416](https://github.com/edspencer/herdctl/pull/416)
+
+---
+
+### Session Wake and Resume Fixes
+**July 23, 2026** · `@herdctl/core@5.26.0`–`5.26.1`
+
+**core** Fixed several session lifecycle issues. Durable session wakes created via `CronCreate` or `ScheduleWakeup` can now be properly cancelled from within the session using `CronDelete` — previously, the wake persisted in herdctl's registry even after deletion. `ToolSearch` tool calls no longer render as perpetually "RUNNING" when reloading old transcripts — the parser now recognizes `tool_reference` content blocks and pairs them correctly. Sessions resumed with a prompt no longer self-interrupt when replaying leftover background tasks from a previous crash. Double-resume collisions (resuming a session that still has a live subprocess) now defer the new resume until the old one is reaped, preventing `[Request interrupted by user]` errors. [#407](https://github.com/edspencer/herdctl/pull/407), [#411](https://github.com/edspencer/herdctl/pull/411), [#412](https://github.com/edspencer/herdctl/pull/412), [#404](https://github.com/edspencer/herdctl/pull/404)
+
+---
+
+### Session Management Improvements
+**July 21–22, 2026** · `@herdctl/core@5.24.0`
+
+**core** getAgentSessions now works correctly with git worktrees — it discovers sessions in the worktree's `.herdctl/` directory instead of always looking in the main repo. Stale adhoc session metadata (orphaned entries for sessions that were deleted outside herdctl) are automatically pruned when loading session lists. Running tools now survive transcript rehydration: in-flight `tool_use` blocks are emitted when the turn hasn't finished yet, so partially-completed tool calls render correctly when resuming or reloading a session. [#397](https://github.com/edspencer/herdctl/pull/397), [#400](https://github.com/edspencer/herdctl/pull/400), [#402](https://github.com/edspencer/herdctl/pull/402)
+
+---
+
+### Job Record Token Accounting and Image Support
+**July 21, 2026** · `@herdctl/core@5.23.0`
+
+**core** Job records now persist detailed per-run token usage (input, output, cache read, cache write) broken down by model, plus the SDK's calculated cost in USD. This data is captured from the SDK's usage report and stored in the job record's `usage` field, making it available for cost tracking and analysis. **core** and **web** now preserve and display images returned by tools or inline agent responses. Image blocks are kept in the transcript, and workspace files are served via the web dashboard so images render directly in chat. [#394](https://github.com/edspencer/herdctl/pull/394), [#396](https://github.com/edspencer/herdctl/pull/396)
+
+---
+
+### MCP Server Session Persistence Fix
+**July 20, 2026** · `@herdctl/core@5.22.0`
+
+**core** Injected MCP servers (used for file uploads in Discord and Slack) are now re-established when a session wakes from a durable timer. Previously, waking a session that used an MCP server would fail because the server connection wasn't restored. The session lifecycle now tracks injected servers and re-injects them on wake. [#391](https://github.com/edspencer/herdctl/pull/391)
+
+---
+
+### Streaming Text Deltas
+**July 19, 2026** · `@herdctl/core@5.21.0` · `@herdctl/chat@0.5.6`
+
+**core** and **chat** now stream partial assistant text deltas on the SDK runtime, matching the streaming behavior already available in CLI runtime. The SDK message translator emits incremental text chunks as they arrive from the API, instead of buffering full messages. This improves perceived responsiveness in web and chat platform UIs. [#383](https://github.com/edspencer/herdctl/pull/383)
+
+---
+
+### Runtime Schedule Mutation and Spawned Trigger Type
+**July 17–18, 2026** · `@herdctl/core@5.20.0`
+
+**core** The scheduler now supports runtime schedule mutation via `FleetManager.updateSchedule()` — enable, disable, or modify cron expressions without restarting the fleet. Added a new `spawned` trigger type for jobs created by other agents via programmatic `trigger()` calls, distinct from `manual`, `schedule`, and `chat` triggers. The scheduler gains a host-execution seam for running jobs directly in the host process instead of always spawning subprocesses, used internally for lightweight delegation tasks. [#379](https://github.com/edspencer/herdctl/pull/379), [#380](https://github.com/edspencer/herdctl/pull/380)
+
+---
+
+### In-Flight Tool Call Events
+**July 15, 2026** · `@herdctl/chat@0.5.4`
+
+**chat** The SDK message translator now emits in-flight `tool_use` blocks via the new `onToolStart` callback as soon as the model decides to call a tool, before the tool executes. This enables UIs to show "Agent is running Bash..." status immediately instead of waiting for the tool to complete. Additive change — existing handlers work unchanged. [#372](https://github.com/edspencer/herdctl/pull/372)
+
+---
+
+### Background Task Session Reaping Fix
+**July 14, 2026** · `@herdctl/core@5.19.0`
+
+**core** Fixed sessions with background tasks being reaped before they could be re-invoked. When a background-task tool (like `Monitor` or `Shell`) completed, the session would reap immediately; if the agent wanted to act on the result, its re-invocation would fail with session-not-found. The reaper now defers reaping for 15 seconds after a background-task completion, giving the agent time to be re-invoked. Also fixed synchronous subagents (like `Task` for inline code edits) incorrectly reaping their parent session when they finished. [#367](https://github.com/edspencer/herdctl/pull/367), [#369](https://github.com/edspencer/herdctl/pull/369)
+
+---
+
+### Task Notification Parsing and Session Discovery Fixes
+**July 13–14, 2026** · `@herdctl/core@5.18.3`–`5.18.4`
+
+**core** The JSONL parser now recognizes `<task-notification>` entries from the Claude harness (subagent status updates), preventing them from appearing as malformed messages in transcripts. Fresh CLI sessions are now resolved by set difference instead of mtime, fixing race conditions where the wrong session was identified when multiple sessions were created in rapid succession. **web** Session usage caching now correctly keys by agent name, fixing stale usage stats when switching between agents. [#360](https://github.com/edspencer/herdctl/pull/360), [#361](https://github.com/edspencer/herdctl/pull/361), [#364](https://github.com/edspencer/herdctl/pull/364)
+
+---
+
+### State Layer Performance Improvements
+**July 11, 2026** · `@herdctl/core@5.18.5`–`5.18.7`
+
+**core** Three state layer performance improvements for large session directories. Parsed transcript messages are now mtime-cached, eliminating redundant parsing on repeated reads (355). Session name and preview resolution uses a negative cache to avoid re-checking missing `autoName`/`preview` files (353). Tool output is no longer duplicated in the in-memory message payload — it's read from the JSONL file on demand (356). Combined, these changes cut session list rendering time by ~60% on directories with hundreds of sessions. [#353](https://github.com/edspencer/herdctl/pull/353), [#355](https://github.com/edspencer/herdctl/pull/355), [#356](https://github.com/edspencer/herdctl/pull/356)
+
+---
+
+### Job Cancellation, OAuth Refresh, and Event Fixes
+**July 11, 2026** · `@herdctl/core@5.18.8`–`5.18.12`
+
+**core** Jobs cancelled via `cancelJob()` now abort via a shared AbortController registry, preventing orphaned subprocesses from running to completion after cancellation. Docker agents with persistent containers now receive refreshed OAuth tokens when the host token is renewed, fixing auth failures on long-running containers. The event system now emits `job:created` immediately at creation time and `job:output` on manual triggers. Added `agent:started` and `agent:stopped` events, and removed the dead `schedule:skipped` event. Fixes several export gaps: `InvalidWorkingDirectoryOverrideError` and its type guard are now exported, and `denied_tools` is correctly passed to the SDK as `disallowedTools`. **web** now honors `web.session_expiry_hours` when managing chat sessions. [#340](https://github.com/edspencer/herdctl/pull/340), [#341](https://github.com/edspencer/herdctl/pull/341), [#342](https://github.com/edspencer/herdctl/pull/342), [#343](https://github.com/edspencer/herdctl/pull/343), [#344](https://github.com/edspencer/herdctl/pull/344), [#347](https://github.com/edspencer/herdctl/pull/347), [#348](https://github.com/edspencer/herdctl/pull/348), [#349](https://github.com/edspencer/herdctl/pull/349)
+
+---
+
+### Session Metadata Cache and Attribution Index Performance
+**July 11, 2026** · `@herdctl/core@5.18.13`–`5.18.14`
+
+**core** Derived per-session facts (isSidechain, usage totals) are now cached in the session metadata store instead of recomputed on every access, cutting session list load time in half on large directories. The attribution index (which maps sessions to agents) is now incremental and validates against file mtime, eliminating full rebuilds on every session discovery call. getAgentSessions enrichment (adding usage, preview, autoName) now runs in parallel with bounded concurrency, improving responsiveness when loading hundreds of sessions. [#320](https://github.com/edspencer/herdctl/pull/320), [#321](https://github.com/edspencer/herdctl/pull/321), [#330](https://github.com/edspencer/herdctl/pull/330)
+
+---
+
 ### Published Package Deduplication Fix
 **July 10, 2026** · `herdctl@1.5.26` · `@herdctl/chat@0.5.5` (and the other packages that declare internal deps)
 
