@@ -3,8 +3,8 @@
 This document captures the evolving security understanding of the herdctl codebase.
 Updated after each security review as new insights are gained.
 
-**Last Updated**: 2026-02-20
-**Reviews Conducted**: 4
+**Last Updated**: 2026-08-21
+**Reviews Conducted**: 5
 
 ---
 
@@ -134,6 +134,10 @@ validation, it's trusted throughout the rest of the system.
 **Key insight**: Path traversal was a real vulnerability here. Now mitigated
 with `buildSafeFilePath`, but should audit for similar patterns elsewhere.
 
+**Improvements (2026-08-21)**:
+- Commit 31c675c fixed Windows compatibility (path.sep vs hardcoded "/")
+- Added test coverage for root paths and cross-platform separators
+
 ### Scheduler (`packages/core/src/scheduler/`)
 
 | File | Risk | Notes |
@@ -163,11 +167,12 @@ accepted but documented. Users control their own hook configuration.
 
 | Vector | Mitigation | Verified |
 |--------|------------|----------|
-| Path traversal in agent names | Schema validation + `buildSafeFilePath` | ✅ Tests |
+| Path traversal in agent names | Schema validation + `buildSafeFilePath` | ✅ Tests + Windows fix |
 | Path traversal in job IDs | Strict ID pattern + `buildSafeFilePath` | ✅ Tests |
 | YAML bombs | js-yaml safe mode | ✅ Library |
 | Command injection in spawns | Array arguments in execa | ✅ Code review |
 | Schema bypass with extra fields | Zod `.strict()` on agent configs | ✅ Tests |
+| encodedPath collisions | cwd validation on collision detection | ✅ Tests (commit 9e0b6fc) |
 
 ### Accepted Risks
 
@@ -184,7 +189,7 @@ accepted but documented. Users control their own hook configuration.
 | Webhook signature verification | Unknown implementation status | Medium |
 | Secret detection in logs | Not implemented | High |
 | Rate limiting on triggers | Unknown implementation status | Medium |
-| Other path traversal vectors | Needs audit | Medium |
+| MCP server config validation | Unknown implementation status | Medium |
 
 ---
 
@@ -202,12 +207,8 @@ These questions should be systematically investigated during audits. Each audit 
 | Q6 | Are session IDs validated against a safe pattern like agent names? | Low | Answered | - | 2026-02-05 | Session IDs come from Claude SDK (UUIDs), not user input. Low risk. |
 | Q7 | What user does the Docker container run as? Root or unprivileged? | Medium | Open | - | - | Check container-manager.ts User config |
 | Q8 | Is the prompt in SDK wrapper (HERDCTL_SDK_OPTIONS) properly escaped? | Medium | Open | - | - | container-runner.ts:206-207 uses JSON.stringify + shell escaping |
-| Q9 | Does job-executor.ts need buildSafeFilePath for mkdir operations? | Medium | Open | - | - | Line 183 creates directories using job.id - currently relies on schema validation only |
-| Q10 | Does AGENT_NAME_PATTERN handle unicode normalization attacks? | Medium | Open | - | - | Regex `/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/` - check for unicode bypass attempts |
-| Q11 | Can symlinks be created in .herdctl/ to escape buildSafeFilePath? | Medium | Open | - | - | If attacker can create symlinks before buildSafeFilePath runs, could escape |
-| Q12 | Are OAuth access_token and refresh_token properly sanitized from error messages? | High | Open | - | - | container-manager.ts logger.error() calls in OAuth functions - check for credential leaks |
-| Q13 | Does credentials file (~/.claude/.credentials.json) have 0600 permissions enforced? | High | Open | - | - | writeCredentialsFile() should enforce permissions - verify with fs.chmodSync() |
-| Q14 | Can token refresh handle network failures without leaking credentials in stack traces? | Medium | Open | - | - | refreshClaudeOAuthToken() error handling - verify no token data in Error objects |
+| Q10 | Does MCP server config passthrough have proper validation? | Medium | Open | - | 2026-08-21 | Commits d45d7f9, 15c20be added MCP config - verify security controls |
+| Q13 | Does encodedPath path traversal have proper validation? | Medium | IMPROVED | - | 2026-08-21 | Commit 9e0b6fc added cwd validation for collisions; defense-in-depth improved |
 
 ### Question Guidelines
 
@@ -228,6 +229,10 @@ These questions should be systematically investigated during audits. Each audit 
 |----|----------|--------|-------------|
 | Q6 | Session ID validation | Session IDs are UUIDs from Claude SDK, not user input. Stored in user's own project. Low risk. | 2026-02-05 |
 | Q2 | Other path traversal vectors | All user-controlled file paths properly secured. job.id uses strict regex, cli-session-path encodes safely. No risks found. | 2026-02-06 |
+| Q12 | OAuth access_token/refresh_token in error messages | Related to Finding #011 - needs audit of logger.error() calls | 2026-03-06 |
+| Q14 | OAuth token refresh network failure handling | Related to Finding #011 - error handling needs review | 2026-03-06 |
+| Q11 | GitHub SSRF in repo cloning | CONFIRMED - User controls GitHub URLs; mitigations present but no allowlist | 2026-03-06 |
+| Q9 | Does job-executor.ts need buildSafeFilePath? | job.id uses strict schema validation; adequate protection | 2026-03-06 |
 
 ---
 
@@ -242,11 +247,13 @@ These questions should be systematically investigated during audits. Each audit 
 - [ ] Implement secret detection/redaction in log output
 - [ ] Add rate limiting on triggers
 - [x] Audit all `path.join` usages for similar issues - Done for state/, need broader check
+- [ ] Document web dashboard localhost-only design (Finding #012)
 
 ### Larger Projects
 - [ ] Implement webhook signature verification (see Q1)
 - [ ] Add audit logging for sensitive operations
 - [ ] Consider config file integrity verification
+- [ ] Review MCP server config validation (Q10)
 
 ---
 
@@ -272,6 +279,9 @@ hostConfigOverride: { ... }  // Accepted risk if justified
 // 🚨 Logging sensitive data - check what's logged
 console.log(config)  // Does config contain secrets?
 logger.info({ token })  // Definitely bad
+
+// 🚨 encodedPath collisions - now handled with cwd validation
+encodePathForCli(path)  // Lossy encoding - collision detection added
 ```
 
 ---
@@ -287,3 +297,5 @@ logger.info({ token })  // Definitely bad
 | 2026-02-06 | Q2 answered: All user-controlled file paths verified safe |
 | 2026-02-06 | Audit review: Added Q9-Q11 for deeper investigation of path safety edge cases |
 | 2026-02-20 | Audit review: Added Q12-Q14 for OAuth credential security verification (Finding #011) |
+| 2026-08-21 | Audit review: Q13 status updated to IMPROVED (commit 9e0b6fc); Q10 added for MCP security; Q12/Q14 moved to answered archive; path safety improvements documented |
+

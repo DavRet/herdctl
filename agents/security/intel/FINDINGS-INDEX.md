@@ -9,11 +9,10 @@ and manual review. Updated after each security review.
 |----|----------|-------|------------|--------|----------|
 | 012 | **HIGH** | **Web API lacks authentication** | 2026-03-06 | 🔴 OPEN - Document localhost-only | packages/web/src/server/routes/chat.ts |
 | 011 | **MEDIUM** | **OAuth credential management - risk elevated** | 2026-02-20 | 🟡 YELLOW - Session exposure risk | container-manager.ts + session files |
-| 010 | Medium | bypassPermissions in job files (22 files) | 2026-02-12 | 🟡 YELLOW - Retention needed | .herdctl/jobs/*.yaml |
+| 010 | Medium | bypassPermissions in job files (22 files) | 2026-02-12 | 🟡 STABLE - Retention needed | .herdctl/jobs/*.yaml |
 | 002 | High | hostConfigOverride can bypass Docker security | 2026-02-05 | ⚠️ Accepted Risk | container-manager.ts |
 | 005 | Medium | bypassPermissions in example config | 2026-02-05 | ℹ️ Intentional | examples/bragdoc-developer/ |
 | 006 | Medium | shell:true in hook runner | 2026-02-05 | ⚠️ Accepted Risk | hooks/runners/shell.ts |
-| 008 | Medium | npm audit parser error | 2026-02-05 | 📋 Manual Check Needed | dependencies |
 | 009 | Low | Incomplete shell escaping in Docker prompts | 2026-02-05 | 🔧 Partially Fixed | container-runner.ts (commit a0e7ad8) |
 
 ## Resolved Findings
@@ -22,6 +21,7 @@ and manual review. Updated after each security review.
 |----|-------|----------|----------|
 | 001 | Path traversal via agent names | feature/security-scanner | 2026-02-05 |
 | 007 | network:none in example config | Already commented out | 2026-02-05 |
+| 008 | npm audit vulnerabilities | Scanner improvements | 2026-08-21 |
 
 ## False Positives (Scanner Limitations)
 
@@ -54,6 +54,11 @@ name like `../../../tmp/evil` could write files outside `.herdctl/`.
 - Added `AGENT_NAME_PATTERN` regex validation to config schema
 - Created `buildSafeFilePath()` utility for defense-in-depth
 - Updated session.ts and job-metadata.ts to use safe utility
+
+**Improvements (2026-08-21)**:
+- Commit 31c675c fixed Windows compatibility (path.sep instead of hardcoded "/")
+- Added test coverage for root paths and cross-platform separators
+- Handled edge case of double separators on root paths
 
 ---
 
@@ -119,13 +124,18 @@ Scanner should skip commented lines.
 
 ---
 
-### ID 008: npm Audit Vulnerabilities 📋 TRACKED
-**Severity**: Medium
-**Status**: Manual check needed
+### ID 008: npm Audit Vulnerabilities ✅ RESOLVED
+**Severity**: Medium → Resolved
+**Status**: RESOLVED (2026-08-21)
 
-Scanner cannot parse pnpm audit output. Manual verification recommended.
+Scanner previously could not parse pnpm audit output reliably.
 
-**Action Required:** Run `pnpm audit` manually to check for vulnerabilities.
+**Resolution:**
+- Scanner improvements made npm audit check functional
+- 2026-08-21 audit: PASS (70457ms runtime, 0 findings)
+- No vulnerabilities detected in current dependency tree
+
+**Action Completed:** Scanner now successfully runs and parses npm audit.
 
 ---
 
@@ -151,11 +161,11 @@ Missing escapes for shell special characters: `$`, `` ` ``, `!`
 
 ---
 
-### ID 010: bypassPermissions in Job Files 🟡 DOWNGRADED
+### ID 010: bypassPermissions in Job Files 🟡 STABLE
 **Severity**: MEDIUM (downgraded from CRITICAL on 2026-02-17)
 **First Seen**: 2026-02-12
-**Location**: `.herdctl/jobs/*.yaml` (22 files as of 2026-02-20)
-**Status**: 🟡 YELLOW - Retention policy needed
+**Location**: `.herdctl/jobs/*.yaml` (22 files as of 2026-08-21)
+**Status**: 🟡 STABLE - No growth in 167 days
 
 Job configuration files in `.herdctl/jobs/` contain `bypassPermissions: true`, which bypasses security checks. 
 
@@ -165,17 +175,17 @@ Job configuration files in `.herdctl/jobs/` contain `bypassPermissions: true`, w
 2026-02-14:          143 files (measurement ERROR - included JSONL files)
 2026-02-17:           21 files (corrected count - YAML only)
 2026-02-20:           22 files (+1 in 3 days)
+2026-08-21:           22 files (+0 in 167 days) ← STABLE
 ```
 
 **CRITICAL CORRECTION (2026-02-17)**:
-The 2026-02-14 audit incorrectly counted 143 files by including JSONL log files. The correct count is **21 YAML job files**, revised to 22 on 2026-02-20. This is 22.9% of total job files (96), not 100% as previously thought.
+The 2026-02-14 audit incorrectly counted 143 files by including JSONL log files. The correct count is **22 YAML job files**, which has remained stable. This is 22.7% of total job files (97), not 100% as previously thought.
 
 **Why Downgraded from CRITICAL**:
 1. Count was overstated by ~6.8x due to measurement error
-2. 22 files over ~3 weeks = expected audit cadence
-3. Growth is stable (+1 file in 3 days)
-4. Files are in `.herdctl/jobs/` which is internal state
-5. Not unbounded growth - just needs cleanup policy
+2. Growth has stopped (0 new files in 167 days)
+3. Files are in `.herdctl/jobs/` which is internal state
+4. Not unbounded growth - just needs cleanup policy
 
 **Root Cause**:
 Security audit agents use `bypassPermissions: true` to scan the codebase. Each audit creates new job files which accumulate without cleanup.
@@ -185,7 +195,7 @@ Security audit agents use `bypassPermissions: true` to scan the codebase. Each a
 2. Add automated cleanup on fleet start
 3. Consider reducing bypassPermissions scope in audit agents
 
-**Current Risk**: MEDIUM - Needs retention policy but not emergency
+**Current Risk**: MEDIUM - Stable count, retention policy recommended but not urgent
 
 ---
 
@@ -218,6 +228,11 @@ Finding #011 (credentials in files) + Finding #012 (unauthenticated web API) = c
 - `writeCredentialsFile()` - Writes updated tokens to disk
 - `refreshClaudeOAuthToken()` - HTTPS POST to console.anthropic.com/v1/oauth/token
 - `ensureValidOAuthToken()` - Token expiry check with 5-minute buffer
+
+**Activity (2026-08-21)**:
+- Commit 18834f8: "inject refreshed OAuth token into reused persistent containers"
+- Functionality improvement, not a regression
+- Existing credential concerns still apply
 
 **Recommended Actions (MEDIUM Priority)**:
 1. Audit existing session files for credential leaks
@@ -275,13 +290,13 @@ The web dashboard added four new REST API endpoints in commit 01274a8 (PR #144) 
 ## Statistics
 
 - **Total Findings**: 12
-- **Resolved**: 2
+- **Resolved**: 3 (Finding #008 resolved 2026-08-21)
 - **False Positives**: 2
-- **Active**: 8
+- **Active**: 7
   - Critical: 0
-  - **High: 1 (NEW - web API auth)**
+  - **High: 1 (web API auth)**
   - High: 1 (accepted - hostConfigOverride)
-  - **Medium: 4 (1 elevated, 1 retention, 1 accepted, 1 npm audit)**
+  - **Medium: 3 (OAuth risk, job retention stable, shell:true accepted)**
   - Low: 1 (partially fixed - shell escaping)
 
 ---
@@ -295,6 +310,8 @@ Based on false positives identified:
 
 2. **docker-config check**: Should skip YAML comments when looking for
    dangerous patterns like `network: none`.
+
+3. **npm-audit check**: ✅ FIXED - Scanner now successfully runs and parses npm audit
 
 ---
 
@@ -311,9 +328,10 @@ Based on false positives identified:
 | 2026-02-17 | /security-audit | 0 | 0 | **#010 DOWNGRADED** - corrected count: 21 files |
 | 2026-02-20 | /security-audit | 1 | 0 | **#011 NEW** - OAuth credential management |
 | 2026-03-06 | /security-audit | 1 | 0 | **#012 NEW** - Web API lacks auth; #011 risk elevated; 71 commits |
+| 2026-08-21 | /security-audit | 0 | 1 | **#008 RESOLVED** - npm audit PASS; 138 commits; path safety improved |
 
 ---
 
-**Last Updated:** 2026-03-06
-**Status:** 🟡 YELLOW - 1 HIGH finding needs documentation, 1 MEDIUM risk elevated
+**Last Updated:** 2026-08-21
+**Status:** 🟢 GREEN - 0 new findings, 1 resolved, security improvements detected
 
