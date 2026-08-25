@@ -204,6 +204,48 @@ export function registerJobRoutes(
   });
 
   /**
+   * POST /api/jobs/:id/messages
+   *
+   * Injects a message into a running session-backed job (one triggered with
+   * `interactive: true`). This is the cross-process inject path: the daemon owns
+   * the live session, so an external receiver cannot reach it through its own
+   * FleetManager instance.
+   *
+   * Auth: none of its own, like every other route here — the server binds
+   * 127.0.0.1 and that loopback bind IS the boundary.
+   *
+   * @param id - Job ID (URL parameter)
+   * @body message - The text to inject
+   * @returns 200 when queued, 404 when the job is not running here or not
+   *   session-backed, 400 on an empty/missing message
+   */
+  server.post<{
+    Params: { id: string };
+    Body: { message?: unknown };
+  }>("/api/jobs/:id/messages", async (request, reply) => {
+    const { id } = request.params;
+    const message = request.body?.message;
+
+    if (typeof message !== "string" || message.trim().length === 0) {
+      return reply.status(400).send({
+        error: "Body must contain a non-empty `message` string",
+        statusCode: 400,
+      });
+    }
+
+    const delivered = fleetManager.sendToJob(id, message);
+    if (!delivered) {
+      return reply.status(404).send({
+        error: `Job is not accepting messages (not running here, or not interactive): ${id}`,
+        statusCode: 404,
+      });
+    }
+
+    logger.info("Injected message into job", { jobId: id, length: message.length });
+    return reply.send({ jobId: id, delivered: true });
+  });
+
+  /**
    * POST /api/jobs/:id/fork
    *
    * Forks an existing job, creating a new job based on its configuration.

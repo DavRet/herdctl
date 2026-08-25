@@ -31,6 +31,7 @@ function createMockFleetManager() {
     enableSchedule: vi.fn(),
     disableSchedule: vi.fn(),
     cancelJob: vi.fn(),
+    sendToJob: vi.fn(),
     forkJob: vi.fn(),
     getAgents: vi.fn().mockReturnValue([]),
     getStateDir: vi.fn().mockReturnValue("/tmp/test-state"),
@@ -393,6 +394,45 @@ describe("Job Routes", () => {
 
       expect(response.statusCode).toBe(500);
       expect(response.json().error).toContain("Disk error");
+    });
+  });
+
+  describe("POST /api/jobs/:id/messages", () => {
+    it("injects a message into a session-backed job", async () => {
+      mockFM.sendToJob.mockReturnValue(true);
+
+      const response = await server.inject({
+        method: "POST",
+        url: "/api/jobs/job-1/messages",
+        payload: { message: "stop and summarize" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ jobId: "job-1", delivered: true });
+      expect(mockFM.sendToJob).toHaveBeenCalledWith("job-1", "stop and summarize");
+    });
+
+    it("returns 404 when the job is not injectable", async () => {
+      mockFM.sendToJob.mockReturnValue(false);
+
+      const response = await server.inject({
+        method: "POST",
+        url: "/api/jobs/job-gone/messages",
+        payload: { message: "hello" },
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+
+    it("returns 400 on an empty message", async () => {
+      const response = await server.inject({
+        method: "POST",
+        url: "/api/jobs/job-1/messages",
+        payload: { message: "   " },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockFM.sendToJob).not.toHaveBeenCalled();
     });
   });
 
