@@ -22,7 +22,14 @@ import {
 } from "../runner/index.js";
 import type { ManagedSession, SessionLifecycleSignal, SessionReaper } from "../session/index.js";
 import { DEFAULT_REINVOCATION_GRACE_MS } from "../session/index.js";
-import { createJob, getJob, getSessionInfo, readJobOutputAll, updateJob } from "../state/index.js";
+import {
+  createJob,
+  getJob,
+  getSessionInfo,
+  readJobOutputAll,
+  toSafeIdentifier,
+  updateJob,
+} from "../state/index.js";
 import type { JobMetadata } from "../state/schemas/job-metadata.js";
 import type { FleetManagerContext } from "./context.js";
 import {
@@ -160,7 +167,8 @@ export class JobControl {
     // the agent's last session as a resume target — skip the fallback lookup.
     // Session identity: agent-scoped by default, caller can scope it narrower
     // (e.g. per ticket) via options.sessionKey.
-    const sessionKey = options?.sessionKey ?? agent.qualifiedName;
+    // Sanitized for the same reason JobExecutor sanitizes it — see there.
+    const sessionKey = toSafeIdentifier(options?.sessionKey ?? agent.qualifiedName);
 
     let sessionId = options?.resume ?? undefined;
     if (sessionId === undefined && options?.resume !== null && !options?.fork) {
@@ -222,6 +230,9 @@ export class JobControl {
     // (no await between the scheduler's capacity check and its insert) and is what
     // actually enforces max_concurrent for trigger-fired jobs. Released in the
     // finally below.
+    // No scheduler (fleet not started) means no shared registry to reserve in, so
+    // max_concurrent is not enforced for this call. Deliberate: without a running
+    // fleet there is no second job to collide with.
     let slotToken: string | null = null;
     if (!options?.bypassConcurrencyLimit && scheduler) {
       const maxConcurrent = agent.instances?.max_concurrent ?? 1;

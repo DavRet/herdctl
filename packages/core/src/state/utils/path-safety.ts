@@ -45,6 +45,23 @@ export function isValidIdentifier(identifier: string): boolean {
 }
 
 /**
+ * Coerce an arbitrary string into an identifier that satisfies
+ * {@link SAFE_IDENTIFIER_PATTERN}.
+ *
+ * For keys derived from external data — work item ids like `owner/repo#12` or
+ * `PROJ-123`, or a caller-supplied session key — where rejecting the input would
+ * be worse than normalizing it. Unsafe characters collapse to `-`; leading and
+ * trailing separators are trimmed. Already-safe identifiers pass through
+ * unchanged, so an agent's qualified name is never rewritten.
+ *
+ * ponytail: lossy — two inputs that normalize identically collide. Hash a suffix
+ * in if a caller ever needs collision-free keys; issue keys don't.
+ */
+export function toSafeIdentifier(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "");
+}
+
+/**
  * Build a safe file path within a base directory
  *
  * This function provides defense-in-depth by:
