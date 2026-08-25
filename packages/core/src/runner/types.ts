@@ -49,6 +49,27 @@ export interface RunnerOptions {
    * else.
    */
   sessionKey?: string;
+  /**
+   * Run this job on a long-lived streaming session instead of a one-shot
+   * `execute()`, so messages can be injected mid-run.
+   *
+   * When `true` AND the runtime implements
+   * {@link import("./runtime/index.js").RuntimeInterface.openSession}, the run
+   * is driven through `openSession()` and drained until the terminal `result`
+   * message. The session stays open for the whole run, so a caller holding the
+   * handle (see {@link onSessionOpen}) can push extra user turns into it — the
+   * SDK delivers them at the next tool boundary of the running turn.
+   *
+   * Ignored (silently, not an error) when the runtime has no `openSession` —
+   * CLI and Docker runtimes fall back to the unchanged `execute()` path.
+   */
+  interactive?: boolean;
+  /**
+   * Called once with the live session handle when {@link interactive} actually
+   * took effect. Never called on the `execute()` path. The handle is only valid
+   * until the run ends; the executor closes it.
+   */
+  onSessionOpen?: (session: import("./runtime/index.js").RuntimeSession) => void;
 }
 
 /**

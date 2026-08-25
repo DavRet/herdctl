@@ -75,7 +75,53 @@ const DEFAULT_RESUME_DEFER_TIMEOUT_MS = 5 * 60_000;
  * using the FleetManagerContext pattern.
  */
 export class JobControl {
+  /**
+   * Live streaming sessions of session-backed trigger jobs, keyed by job id.
+   *
+   * Sibling of the AbortController registry (`ctx.registerJob`), but kept local:
+   * only {@link trigger} creates these, and only {@link sendToJob} /
+   * {@link interruptJob} consume them. Entries are added when the session opens
+   * and removed in `trigger`'s finally, so a lookup miss means "not running, or
+   * not session-backed" — exactly what the public API reports as `false`.
+   */
+  private readonly runningSessions = new Map<string, RuntimeSession>();
+
   constructor(private ctx: FleetManagerContext) {}
+
+  /**
+   * Push a user message into a running session-backed job.
+   *
+   * @returns `false` when no such job is running **in this process** or the job
+   *   is not session-backed (`interactive` was not set / the runtime has no
+   *   streaming sessions). `true` means the message was queued — the SDK
+   *   delivers it at the running turn's next tool boundary, so delivery is not
+   *   instantaneous.
+   */
+  sendToJob(jobId: string, text: string): boolean {
+    const session = this.runningSessions.get(jobId);
+    if (!session) return false;
+    // Fire-and-forget: the queue push is synchronous inside the SDK session; we
+    // only guard against a rejected promise crashing the process.
+    void session.send(text).catch((error) => {
+      this.ctx.getLogger().warn(`Failed to send to job ${jobId}: ${(error as Error).message}`);
+    });
+    return true;
+  }
+
+  /**
+   * Interrupt the current turn of a running session-backed job without closing
+   * it — further {@link sendToJob} calls stay valid.
+   *
+   * @returns `false` under the same conditions as {@link sendToJob}.
+   */
+  interruptJob(jobId: string): boolean {
+    const session = this.runningSessions.get(jobId);
+    if (!session) return false;
+    void session.interrupt().catch((error) => {
+      this.ctx.getLogger().warn(`Failed to interrupt job ${jobId}: ${(error as Error).message}`);
+    });
+    return true;
+  }
 
   /**
    * Manually trigger an agent outside its normal schedule
@@ -281,6 +327,12 @@ export class JobControl {
         },
         resume: sessionId,
         sessionKey: options?.sessionKey,
+        interactive: options?.interactive,
+        // Only fires when the run really is session-backed; register the handle
+        // so sendToJob/interruptJob can reach this job while it runs.
+        onSessionOpen: (session) => {
+          if (registeredJobId) this.runningSessions.set(registeredJobId, session);
+        },
         fork: options?.fork,
         forkedFrom: options?.forkedFrom,
         injectedMcpServers: options?.injectedMcpServers,
@@ -290,6 +342,9 @@ export class JobControl {
     } finally {
       if (registeredJobId) {
         this.ctx.unregisterJob?.(registeredJobId);
+        // The executor already closed the session; drop the handle so a late
+        // sendToJob reports `false` instead of pushing into a dead queue.
+        this.runningSessions.delete(registeredJobId);
       }
       if (slotToken !== null) {
         scheduler?.releaseJobSlot(agentName, slotToken);

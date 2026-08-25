@@ -2593,3 +2593,151 @@ describe("session expiration handling", () => {
     expect(lastUsedMs).toBeGreaterThan(new Date(twentyThreeHoursAgo).getTime());
   });
 });
+
+// =============================================================================
+// Session-backed (interactive) jobs
+// =============================================================================
+
+/**
+ * Mock runtime that implements `openSession`. The session yields the supplied
+ * messages, records every injected turn, and reports whether it was closed.
+ */
+function createMockSessionRuntime(messages: SDKMessage[]) {
+  const sent: string[] = [];
+  const state = { opened: 0, closed: 0, sent, lastOptions: undefined as any };
+
+  const runtime: any = {
+    execute: async function* () {
+      throw new Error("execute() must not be used when openSession() is available");
+    },
+    openSession: (options: any) => {
+      state.opened++;
+      state.lastOptions = options;
+      return {
+        messages: (async function* () {
+          for (const message of messages) {
+            yield message;
+          }
+          // A real session's stream does not end after the result — it stays
+          // open until close(). Block forever so a missing terminal-break in the
+          // executor hangs the test instead of passing by accident.
+          await new Promise(() => {});
+        })(),
+        send: async (text: string) => {
+          sent.push(text);
+        },
+        interrupt: async () => {},
+        listCommands: async () => [],
+        setModel: async () => {},
+        close: async () => {
+          state.closed++;
+        },
+      };
+    },
+  };
+
+  return { runtime, state };
+}
+
+describe("JobExecutor session-backed jobs", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("drives the run through openSession, drains to result, and closes it", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "session-abc" } as SDKMessage,
+      { type: "assistant", content: "Working" },
+      { type: "result", subtype: "success", result: "All done" } as SDKMessage,
+    ]);
+
+    let handle: unknown;
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "interactive-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      onSessionOpen: (session) => {
+        handle = session;
+      },
+    });
+
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+    expect(handle).toBeDefined();
+    expect(result.success).toBe(true);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.interactive).toBe(true);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("closes the session when the run fails", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "error", message: "boom" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "failing-interactive-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(result.success).toBe(false);
+    expect(state.closed).toBe(1);
+  });
+
+  it("falls back to execute() when the runtime has no openSession", async () => {
+    const runtime = createMockRuntimeWithMessages([
+      { type: "system", content: "Initialized" },
+      { type: "result", subtype: "success", result: "Done" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "cli-style-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(result.success).toBe(true);
+
+    // Not an error, just not session-backed — and the job record says so.
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.interactive).toBeFalsy();
+  });
+
+  it("uses execute() when interactive is not requested", async () => {
+    const { runtime, state } = createMockSessionRuntime([]);
+    runtime.execute = async function* () {
+      yield { type: "result", subtype: "success", result: "Done" } as SDKMessage;
+    };
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "batch-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+    });
+
+    expect(result.success).toBe(true);
+    expect(state.opened).toBe(0);
+  });
+});

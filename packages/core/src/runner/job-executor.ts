@@ -44,7 +44,7 @@ import {
   isTerminalMessage,
   processSDKMessage,
 } from "./message-processor.js";
-import type { RuntimeInterface } from "./runtime/index.js";
+import type { RuntimeInterface, RuntimeSession } from "./runtime/index.js";
 import type {
   ProcessedMessage,
   RunnerErrorDetails,
@@ -163,6 +163,15 @@ export class JobExecutor {
     // (e.g. "owner/repo#12") would strand an orphan job.
     const sessionKey = toSafeIdentifier(options.sessionKey ?? agent.qualifiedName);
 
+    // Does this run actually get a long-lived streaming session? Only when the
+    // caller asked AND the runtime can provide one (CLI/Docker cannot) — the
+    // fallback is silent, so `interactive` is safe to set unconditionally. The
+    // resolved value is recorded on the job so an out-of-process receiver can
+    // tell which jobs accept injected messages.
+    const openSession =
+      options.interactive === true ? this.runtime.openSession?.bind(this.runtime) : undefined;
+    const sessionBacked = openSession !== undefined;
+
     const jobsDir = join(stateDir, "jobs");
     let job: JobMetadata;
     let sessionId: string | undefined;
@@ -187,6 +196,7 @@ export class JobExecutor {
         prompt,
         schedule,
         forked_from: options.fork ? options.forkedFrom : undefined,
+        interactive: sessionBacked ? true : undefined,
       });
 
       this.logger.info?.(`Created job ${job.id} for agent ${agent.name}`);
@@ -432,12 +442,26 @@ export class JobExecutor {
     let retriedAfterTokenExpiry = false;
 
     const executeWithRetry = async (resumeSessionId: string | undefined): Promise<void> => {
+      // Session-backed runs hold the handle here so the retry paths and the
+      // finally below can tear it down; the `execute()` path leaves it undefined.
+      let session: RuntimeSession | undefined;
+      const closeSession = async (): Promise<void> => {
+        const open = session;
+        session = undefined;
+        if (!open) return;
+        try {
+          await open.close();
+        } catch (closeError) {
+          this.logger.warn(`Failed to close session: ${(closeError as Error).message}`);
+        }
+      };
+
       try {
         let messages: AsyncIterable<SDKMessage>;
 
         // Catch runtime initialization errors
         try {
-          messages = this.runtime.execute({
+          const runtimeOptions = {
             prompt,
             agent: options.agent,
             resume: resumeSessionId,
@@ -449,7 +473,29 @@ export class JobExecutor {
             abortController: options.abortController,
             injectedMcpServers: options.injectedMcpServers,
             systemPromptAppend: options.systemPromptAppend,
-          });
+          };
+
+          if (openSession) {
+            // A session's close() aborts the controller it was handed, as a
+            // teardown backstop. Handing it the JOB's controller would make
+            // ordinary end-of-run cleanup indistinguishable from a cancellation
+            // (the run would be recorded `cancelled`, not `completed`), so the
+            // session gets its own and the job's abort is forwarded one-way.
+            const sessionAbort = new AbortController();
+            const jobSignal = options.abortController?.signal;
+            if (jobSignal?.aborted) {
+              sessionAbort.abort();
+            } else {
+              jobSignal?.addEventListener("abort", () => sessionAbort.abort(), { once: true });
+            }
+
+            const opened = openSession({ ...runtimeOptions, abortController: sessionAbort });
+            session = opened;
+            options.onSessionOpen?.(opened);
+            messages = opened.messages;
+          } else {
+            messages = this.runtime.execute(runtimeOptions);
+          }
         } catch (initError) {
           // Wrap initialization errors with context
           throw new SDKInitializationError(
@@ -624,6 +670,9 @@ export class JobExecutor {
           retriedAfterSessionExpiry = true;
           lastError = undefined;
           messagesReceived = 0;
+          // Tear the failed session down before the retry opens a new one, so
+          // two `claude` processes never run for this job at once.
+          await closeSession();
           await executeWithRetry(undefined);
           return;
         }
@@ -661,6 +710,9 @@ export class JobExecutor {
           // Retry with a fresh session (no resume)
           retriedAfterSessionExpiry = true;
           messagesReceived = 0; // Reset for fresh session
+          // Tear the failed session down before the retry opens a new one, so
+          // two `claude` processes never run for this job at once.
+          await closeSession();
           await executeWithRetry(undefined);
           return;
         }
@@ -687,6 +739,9 @@ export class JobExecutor {
           // Retry — buildContainerEnv() will refresh the token from the credentials file
           retriedAfterTokenExpiry = true;
           messagesReceived = 0;
+          // Tear the failed session down before the retry opens a new one, so
+          // two `claude` processes never run for this job at once.
+          await closeSession();
           await executeWithRetry(undefined);
           return;
         }
@@ -722,6 +777,10 @@ export class JobExecutor {
             `Failed to write error to job output: ${(outputError as Error).message}`,
           );
         }
+      } finally {
+        // Always release the session — success, failure, or abort. A leaked
+        // session keeps a `claude` process (and its RSS) alive indefinitely.
+        await closeSession();
       }
     };
 
