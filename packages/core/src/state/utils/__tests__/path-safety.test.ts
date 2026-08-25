@@ -5,6 +5,7 @@ import {
   isValidIdentifier,
   PathTraversalError,
   SAFE_IDENTIFIER_PATTERN,
+  toSafeIdentifier,
 } from "../path-safety.js";
 
 describe("PathTraversalError", () => {
@@ -262,5 +263,27 @@ describe("buildSafeFilePath", () => {
       const result = buildSafeFilePath(baseWithTrailingSep, "agent", ".json");
       expect(result).toBe(join(baseWithTrailingSep, "agent.json"));
     });
+  });
+});
+
+describe("toSafeIdentifier", () => {
+  it("passes an already-safe identifier through unchanged", () => {
+    expect(toSafeIdentifier("herdctl.security-auditor")).toBe("herdctl.security-auditor");
+  });
+
+  it("normalizes an external work item id", () => {
+    expect(toSafeIdentifier("jandaroscher/vulpes-pack#12")).toBe("jandaroscher-vulpes-pack-12");
+  });
+
+  it("falls back to a hash when nothing safe is left", () => {
+    for (const raw of ["", "###", "..."]) {
+      const key = toSafeIdentifier(raw);
+      expect(key).not.toBe("");
+      expect(isValidIdentifier(key)).toBe(true);
+    }
+  });
+
+  it("gives distinct hashes to distinct unsafe inputs", () => {
+    expect(toSafeIdentifier("###")).not.toBe(toSafeIdentifier("..."));
   });
 });

@@ -5,6 +5,7 @@
  * when constructing file paths from user-controlled identifiers.
  */
 
+import { createHash } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 
 /**
@@ -54,11 +55,17 @@ export function isValidIdentifier(identifier: string): boolean {
  * trailing separators are trimmed. Already-safe identifiers pass through
  * unchanged, so an agent's qualified name is never rewritten.
  *
- * ponytail: lossy — two inputs that normalize identically collide. Hash a suffix
- * in if a caller ever needs collision-free keys; issue keys don't.
+ * An input with nothing safe left in it (`""`, `"###"`, `"..."`) falls back to a
+ * hash of the input, so the result always satisfies the pattern and two such
+ * inputs still get distinct identifiers.
+ *
+ * ponytail: lossy — two inputs that normalize identically collide. Hash the whole
+ * key if a caller ever needs collision-free identifiers; issue keys don't.
  */
 export function toSafeIdentifier(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "");
+  const safe = raw.replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "");
+
+  return safe === "" ? `k${createHash("sha1").update(raw).digest("hex").slice(0, 8)}` : safe;
 }
 
 /**
