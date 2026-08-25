@@ -28,7 +28,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   }),
 }));
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConcurrencyLimitError } from "../errors.js";
@@ -95,6 +95,36 @@ describe("trigger() concurrency accounting", () => {
 
     // Second trigger must succeed once the first one has completed.
     await expect(manager.trigger("solo")).resolves.toMatchObject({ agentName: "solo" });
+  });
+
+  it("rejects exactly one of two simultaneous triggers", async () => {
+    const manager = createTestManager();
+    await manager.initialize();
+
+    // Both calls start before either awaits — the reservation, not the early
+    // check, is what has to separate them.
+    const both = Promise.allSettled([manager.trigger("solo"), manager.trigger("solo")]);
+    setTimeout(() => gate.release(), 50);
+    const outcomes = await both;
+
+    const rejected = outcomes.filter((o) => o.status === "rejected");
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(ConcurrencyLimitError);
+  });
+
+  it("sanitizes an unsafe sessionKey instead of stranding the job", async () => {
+    const manager = createTestManager();
+    await manager.initialize();
+
+    gate.release();
+    // Slash and hash are rejected by session storage's identifier guard; an
+    // unsanitized key would throw after the job record was already created.
+    const result = await manager.trigger("solo", undefined, {
+      sessionKey: "jandaroscher/vulpes-pack#12",
+    });
+
+    expect(result.success).toBe(true);
+    expect(await readdir(join(stateDir, "sessions"))).toEqual(["jandaroscher-vulpes-pack-12.json"]);
   });
 
   it("still bypasses the limit with bypassConcurrencyLimit", async () => {

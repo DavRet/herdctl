@@ -22,6 +22,7 @@ import {
   type JobMetadata,
   type RunUsage,
   type TriggerType,
+  toSafeIdentifier,
   updateJob,
   updateSessionInfo,
   validateRuntimeContext,
@@ -156,7 +157,11 @@ export class JobExecutor {
     // item) by passing `sessionKey`. Every session read/write below goes through
     // this, while the job record keeps `agent.qualifiedName` so jobs stay grouped
     // by agent regardless of session scoping.
-    const sessionKey = options.sessionKey ?? agent.qualifiedName;
+    // Sanitized, not trusted: session storage rejects anything outside
+    // SAFE_IDENTIFIER_PATTERN with a PathTraversalError, and by the time the first
+    // session read happens the job record already exists — an unsanitized key
+    // (e.g. "owner/repo#12") would strand an orphan job.
+    const sessionKey = toSafeIdentifier(options.sessionKey ?? agent.qualifiedName);
 
     const jobsDir = join(stateDir, "jobs");
     let job: JobMetadata;

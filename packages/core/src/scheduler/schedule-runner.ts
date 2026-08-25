@@ -12,7 +12,7 @@ import { join } from "node:path";
 import type { ResolvedAgent, Schedule } from "../config/index.js";
 import type { RunnerResult } from "../runner/index.js";
 import { JobExecutor, type JobExecutorOptions, RuntimeFactory } from "../runner/index.js";
-import { getSessionInfo } from "../state/index.js";
+import { getSessionInfo, toSafeIdentifier } from "../state/index.js";
 import type { ScheduleState } from "../state/schemas/fleet-state.js";
 import { createLogger } from "../utils/logger.js";
 import type {
@@ -24,18 +24,6 @@ import type {
 import { calculateNextCronTrigger } from "./cron.js";
 import { calculateNextTrigger } from "./interval.js";
 import { type ScheduleStateLogger, updateScheduleState } from "./schedule-state.js";
-
-/**
- * Coerce an arbitrary string into a safe session-file identifier.
- *
- * Work item ids are external (`OWNER/REPO#12`, `PROJ-123`, ...) and session storage
- * only accepts `[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?`. Unsafe characters become
- * `-`; leading/trailing separators are trimmed. Collisions between two ids that
- * normalize identically are possible in theory but not in practice for issue keys.
- */
-function toSessionKey(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "");
-}
 
 // =============================================================================
 // Types
@@ -310,7 +298,7 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
     // pollute) one conversation. Without a work item the key stays the agent's
     // qualified name, i.e. behavior is unchanged.
     const sessionKey = workItem
-      ? toSessionKey(`${agent.qualifiedName}--${workItem.id}`)
+      ? toSafeIdentifier(`${agent.qualifiedName}--${workItem.id}`)
       : agent.qualifiedName;
 
     // Step 3: Build the prompt
