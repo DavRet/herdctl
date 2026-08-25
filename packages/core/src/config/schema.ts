@@ -24,7 +24,7 @@ export const PermissionModeSchema = z.enum([
 // Work Source Schemas
 // =============================================================================
 
-export const WorkSourceTypeSchema = z.enum(["github"]);
+export const WorkSourceTypeSchema = z.enum(["github", "jira"]);
 
 export const WorkSourceLabelsSchema = z.object({
   ready: z.string().optional(),
@@ -104,11 +104,18 @@ export const GitHubWorkSourceSchema = z.object({
  * Base work source schema (minimal, for backwards compatibility)
  * Used when only type and basic labels are specified
  */
-export const BaseWorkSourceSchema = z.object({
-  type: WorkSourceTypeSchema,
-  labels: WorkSourceLabelsSchema.optional(),
-  cleanup_in_progress: z.boolean().optional(),
-});
+export const BaseWorkSourceSchema = z
+  .object({
+    type: WorkSourceTypeSchema,
+    labels: WorkSourceLabelsSchema.optional(),
+    cleanup_in_progress: z.boolean().optional(),
+  })
+  // Keep unknown keys instead of stripping them: a non-GitHub work source
+  // registered via `registerWorkSource(type, factory)` carries adapter-specific
+  // config (e.g. a Jira project key / JQL) that core has no schema for. Stripping
+  // it here would hand the adapter an empty config. Adapter-side validation owns
+  // the shape of these fields.
+  .catchall(z.unknown());
 
 /**
  * Combined work source schema supporting both minimal and full configurations

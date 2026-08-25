@@ -374,8 +374,25 @@ describe("WorkSourceSchema", () => {
   });
 
   it("rejects invalid type", () => {
-    const result = WorkSourceSchema.safeParse({ type: "jira" });
+    const result = WorkSourceSchema.safeParse({ type: "gitlab" });
     expect(result.success).toBe(false);
+  });
+
+  it("accepts the jira work source type", () => {
+    const result = WorkSourceSchema.safeParse({ type: "jira" });
+    expect(result.success).toBe(true);
+  });
+
+  it("keeps adapter-specific config for non-github work sources", () => {
+    const result = WorkSourceSchema.safeParse({
+      type: "jira",
+      project: "AI",
+      jql: "status = Ready",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toMatchObject({ project: "AI", jql: "status = Ready" });
+    }
   });
 
   it("parses full GitHub work source configuration", () => {
