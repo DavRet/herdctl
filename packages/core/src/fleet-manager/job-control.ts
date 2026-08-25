@@ -158,13 +158,17 @@ export class JobControl {
     // while resume=undefined means "use fallback session lookup"
     // A fork names its own source session (options.fork) and must NOT inherit
     // the agent's last session as a resume target — skip the fallback lookup.
+    // Session identity: agent-scoped by default, caller can scope it narrower
+    // (e.g. per ticket) via options.sessionKey.
+    const sessionKey = options?.sessionKey ?? agent.qualifiedName;
+
     let sessionId = options?.resume ?? undefined;
     if (sessionId === undefined && options?.resume !== null && !options?.fork) {
       try {
         const sessionsDir = join(stateDir, "sessions");
         // Use session timeout config for expiry validation (default: 24h)
         const sessionTimeout = agent.session?.timeout ?? "24h";
-        const existingSession = await getSessionInfo(sessionsDir, agent.qualifiedName, {
+        const existingSession = await getSessionInfo(sessionsDir, sessionKey, {
           timeout: sessionTimeout,
           logger,
           // Resolve any CLI transcript existence check against the configured
@@ -212,6 +216,25 @@ export class JobControl {
     const lifecycleManager = this.ctx.getSessionLifecycle?.() ?? undefined;
     const lifecycleTracker = lifecycleManager?.trackJob(agentName, sessionId);
 
+    // Reserve the concurrency slot. The check above is an early-out only: it reads
+    // a count that can go stale across the awaits in between (session lookup), so
+    // two parallel trigger() calls could both pass it. This reservation is atomic
+    // (no await between the scheduler's capacity check and its insert) and is what
+    // actually enforces max_concurrent for trigger-fired jobs. Released in the
+    // finally below.
+    let slotToken: string | null = null;
+    if (!options?.bypassConcurrencyLimit && scheduler) {
+      const maxConcurrent = agent.instances?.max_concurrent ?? 1;
+      slotToken = scheduler.acquireJobSlot(agentName, maxConcurrent);
+      if (slotToken === null) {
+        throw new ConcurrencyLimitError(
+          agentName,
+          scheduler.getRunningJobCount(agentName),
+          maxConcurrent,
+        );
+      }
+    }
+
     // Execute the job - this creates the job record and runs it
     // Note: Job output is written to JSONL by JobExecutor; log streaming picks it up
     // If onMessage callback is provided, it will be called for each SDK message
@@ -256,6 +279,7 @@ export class JobControl {
           options?.onJobCreated?.(id);
         },
         resume: sessionId,
+        sessionKey: options?.sessionKey,
         fork: options?.fork,
         forkedFrom: options?.forkedFrom,
         injectedMcpServers: options?.injectedMcpServers,
@@ -268,6 +292,9 @@ export class JobControl {
         this.ctx.unregisterJob?.(registeredJobId);
       }
       lifecycleTracker?.release();
+      if (slotToken !== null) {
+        scheduler?.releaseJobSlot(agentName, slotToken);
+      }
     }
 
     // If the run was cancelled mid-flight, cancelJob() has already recorded the
