@@ -146,6 +146,14 @@ export const JobMetadataSchema = z.object({
    * and for runs that produced no terminal usage — backward-compatible.
    */
   usage: RunUsageSchema.nullable().optional(),
+
+  /**
+   * `true` when this job runs on a long-lived streaming session and therefore
+   * accepts mid-run message injection (`FleetManager.sendToJob`). Absent for
+   * every ordinary one-shot job — an out-of-process receiver reads this field
+   * to decide whether a running job is injectable at all.
+   */
+  interactive: z.boolean().nullable().optional(),
 });
 
 // =============================================================================
@@ -177,6 +185,8 @@ export interface CreateJobOptions {
   prompt?: string | null;
   /** Parent job ID (for forked jobs) */
   forked_from?: string | null;
+  /** Mark the job as session-backed / injectable (see JobMetadata.interactive) */
+  interactive?: boolean;
 }
 
 /**
@@ -225,5 +235,8 @@ export function createJobMetadata(
     summary: null,
     output_file: null,
     usage: null,
+    // Left undefined (not `false`) for ordinary jobs so existing job files and
+    // their assertions keep their exact shape.
+    interactive: options.interactive === true ? true : undefined,
   };
 }

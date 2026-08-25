@@ -591,6 +591,23 @@ export interface TriggerOptions {
   sessionKey?: string;
 
   /**
+   * Run this trigger on a long-lived streaming session so messages can be
+   * injected into it while it runs ({@link FleetManager.sendToJob}).
+   *
+   * Off by default: a trigger is a one-shot `execute()` run that cannot be
+   * talked to. With `interactive: true` the job is driven through the runtime's
+   * `openSession()` instead and drained until its terminal result — a caller
+   * can push extra user turns in between (the SDK delivers them at the running
+   * turn's next tool boundary). {@link sessionKey} still decides which session
+   * is used.
+   *
+   * Silently ignored by runtimes without streaming sessions (`cli`, `docker`):
+   * those fall back to the unchanged one-shot path rather than failing. The
+   * resolved value is recorded as `interactive` on the job record.
+   */
+  interactive?: boolean;
+
+  /**
    * Session ID to FORK for this trigger.
    *
    * When provided, the agent resumes `fork`'s transcript as context but writes

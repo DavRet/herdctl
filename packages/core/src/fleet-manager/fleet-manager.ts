@@ -1214,6 +1214,23 @@ export class FleetManager extends EventEmitter implements FleetManagerContext {
   async cancelJob(jobId: string, options?: { timeout?: number }): Promise<CancelJobResult> {
     return this.jobControl.cancelJob(jobId, options);
   }
+  /**
+   * Push a message into a running session-backed job (one triggered with
+   * `interactive: true`). See {@link JobControl.sendToJob}.
+   *
+   * @returns `false` if the job is not running in this process or is not
+   *   session-backed.
+   */
+  sendToJob(jobId: string, text: string): boolean {
+    return this.jobControl.sendToJob(jobId, text);
+  }
+  /**
+   * Interrupt the current turn of a running session-backed job, leaving the
+   * session open. See {@link JobControl.interruptJob}.
+   */
+  interruptJob(jobId: string): boolean {
+    return this.jobControl.interruptJob(jobId);
+  }
   async forkJob(jobId: string, modifications?: JobModifications): Promise<ForkJobResult> {
     return this.jobControl.forkJob(jobId, modifications);
   }
