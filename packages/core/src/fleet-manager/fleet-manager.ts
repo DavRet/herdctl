@@ -100,6 +100,32 @@ function createDefaultLogger(): FleetManagerLogger {
 }
 
 /**
+ * Callbacks registered via {@link onFleetManagerStarted}, in registration order.
+ */
+const fleetManagerStartedCallbacks: ((fleetManager: FleetManager) => void)[] = [];
+
+/**
+ * Register a callback that receives the **daemon's** FleetManager instance.
+ *
+ * This is the seam for in-process extensions loaded before the CLI runs — e.g.
+ * a `node --import` preload that wants to drive jobs on the long-running fleet
+ * (`FleetManager.trigger`, `sendToJob`) rather than spawning its own
+ * short-lived process with its own, unrelated FleetManager.
+ *
+ * Fires from {@link FleetManager.start}, not from the constructor: `start()` is
+ * reached only by `herdctl start`, while every other CLI command stops at
+ * `initialize()`. So the callback sees exactly the daemon instance and needs no
+ * filtering of its own. By then the config is loaded and the fleet is `running`.
+ *
+ * A callback that throws is logged to stderr and skipped — an extension must
+ * never take the fleet down with it. Registrations after `start()` are never
+ * called; register at import time.
+ */
+export function onFleetManagerStarted(callback: (fleetManager: FleetManager) => void): void {
+  fleetManagerStartedCallbacks.push(callback);
+}
+
+/**
  * FleetManager provides high-level orchestration for autonomous agents
  *
  * Implements FleetManagerContext to provide clean access to internal state
@@ -469,6 +495,17 @@ export class FleetManager extends EventEmitter implements FleetManagerContext {
 
       this.logger.info("Fleet manager started");
       this.emit("started");
+
+      // Hand the live daemon instance to in-process extensions (see
+      // onFleetManagerStarted). Never let one take the fleet down.
+      for (const callback of fleetManagerStartedCallbacks) {
+        try {
+          callback(this);
+        } catch (error) {
+          const message = error instanceof Error ? error.stack : String(error);
+          process.stderr.write(`onFleetManagerStarted callback failed: ${message}\n`);
+        }
+      }
 
       // Announce each configured agent as started now that the scheduler is
       // monitoring its schedules and chat managers (event subscribers) are up.
