@@ -134,6 +134,36 @@ describe("FleetManager.sendToJob", () => {
     expect(manager.interruptJob("job-2026-01-01-abcdef")).toBe(false);
   });
 
+  it("returns false once the run has stopped reading its input", async () => {
+    const manager = createManager();
+    await manager.initialize();
+
+    let jobId: string | undefined;
+    const run = manager.trigger("chatty", undefined, {
+      prompt: "initial",
+      interactive: true,
+      onJobCreated: (id) => {
+        jobId = id;
+      },
+    });
+
+    let delivered = false;
+    for (let attempt = 0; attempt < 200 && !delivered; attempt++) {
+      if (jobId) delivered = manager.sendToJob(jobId, "injected mid-run");
+      if (!delivered) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(delivered).toBe(true);
+
+    await run;
+
+    // The registry entry is dropped in trigger's finally, but the handle stops
+    // accepting input the moment the terminal message lands — the window in
+    // between must not report a delivery that MessageQueue would swallow.
+    expect(manager.sendToJob(jobId as string, "after the result")).toBe(false);
+    expect(manager.interruptJob(jobId as string)).toBe(false);
+    expect(injectedTurns).toEqual(["initial", "injected mid-run"]);
+  });
+
   it("returns false for a non-interactive job", async () => {
     const manager = createManager();
     await manager.initialize();

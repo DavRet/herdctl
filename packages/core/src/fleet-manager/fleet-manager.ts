@@ -120,6 +120,10 @@ const fleetManagerStartedCallbacks: ((fleetManager: FleetManager) => void)[] = [
  * A callback that throws is logged to stderr and skipped — an extension must
  * never take the fleet down with it. Registrations after `start()` are never
  * called; register at import time.
+ *
+ * Fires at most once per FleetManager instance, but the registry is
+ * process-global and a process may (in tests, or after a stop/start) start more
+ * than one fleet — so extensions must be idempotent per instance they receive.
  */
 export function onFleetManagerStarted(callback: (fleetManager: FleetManager) => void): void {
   fleetManagerStartedCallbacks.push(callback);
@@ -189,6 +193,11 @@ export class FleetManager extends EventEmitter implements FleetManagerContext {
   // in-flight job. Keyed by id → concurrency-safe when max_concurrent > 1.
   // See edspencer/herdctl#324.
   private readonly runningJobControllers: Map<string, AbortController> = new Map();
+
+  // Guards onFleetManagerStarted against firing twice for this instance — a
+  // stopped fleet can be started again, and an extension re-running its wiring
+  // would double-register whatever it installed.
+  private startedCallbacksFired = false;
 
   constructor(options: FleetManagerOptions) {
     super();
@@ -497,8 +506,11 @@ export class FleetManager extends EventEmitter implements FleetManagerContext {
       this.emit("started");
 
       // Hand the live daemon instance to in-process extensions (see
-      // onFleetManagerStarted). Never let one take the fleet down.
-      for (const callback of fleetManagerStartedCallbacks) {
+      // onFleetManagerStarted). Once per instance; never let one take the fleet
+      // down.
+      const fireStartedCallbacks = !this.startedCallbacksFired;
+      this.startedCallbacksFired = true;
+      for (const callback of fireStartedCallbacks ? fleetManagerStartedCallbacks : []) {
         try {
           callback(this);
         } catch (error) {
@@ -1262,8 +1274,9 @@ export class FleetManager extends EventEmitter implements FleetManagerContext {
     return this.jobControl.sendToJob(jobId, text);
   }
   /**
-   * Interrupt the current turn of a running session-backed job, leaving the
-   * session open. See {@link JobControl.interruptJob}.
+   * Interrupt a running session-backed job. This ENDS the run — the session is
+   * closed and the job is recorded as `cancelled`, not `completed`. See
+   * {@link JobControl.interruptJob}.
    */
   interruptJob(jobId: string): boolean {
     return this.jobControl.interruptJob(jobId);

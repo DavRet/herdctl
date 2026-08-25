@@ -608,6 +608,14 @@ export interface TriggerOptions {
   interactive?: boolean;
 
   /**
+   * Ceiling for a session-backed run, in milliseconds (default
+   * `DEFAULT_SESSION_TIMEOUT_MS`, 2h). On expiry the session is closed and the
+   * job is recorded as failed, releasing its concurrency slot. Only meaningful
+   * together with {@link interactive}; a one-shot run ends on its own.
+   */
+  sessionTimeoutMs?: number;
+
+  /**
    * Session ID to FORK for this trigger.
    *
    * When provided, the agent resumes `fork`'s transcript as context but writes

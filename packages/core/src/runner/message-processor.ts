@@ -424,6 +424,23 @@ function processAuthStatusMessage(message: SDKMessage): ProcessedMessage {
  * SDK result messages indicate the completion of a query and contain
  * summary information, usage statistics, and the final result.
  */
+/**
+ * Does a terminal `result` message report a failed run?
+ *
+ * True when the runtime set `is_error`, or when the subtype is anything other
+ * than `"success"` (`max_turns`, `error_during_execution`, an interrupted turn).
+ * Non-`result` messages are never error results — an `error` message is handled
+ * on its own path.
+ *
+ * The single definition of "this run did not succeed", shared by the output
+ * record and by the job's final status.
+ */
+export function isErrorResult(message: SDKMessage): boolean {
+  if (!message || typeof message !== "object" || message.type !== "result") return false;
+  const resultMsg = message as { subtype?: string; is_error?: boolean };
+  return Boolean(resultMsg.is_error) || (!!resultMsg.subtype && resultMsg.subtype !== "success");
+}
+
 function processResultMessage(message: SDKMessage): ProcessedMessage {
   const resultMsg = message as {
     subtype?: string;
@@ -436,7 +453,7 @@ function processResultMessage(message: SDKMessage): ProcessedMessage {
   };
 
   // Determine if this is an error result
-  const isError = resultMsg.is_error || (resultMsg.subtype && resultMsg.subtype !== "success");
+  const isError = isErrorResult(message);
 
   const output: JobOutputInput = {
     type: "tool_result",
