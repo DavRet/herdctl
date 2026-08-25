@@ -76,6 +76,20 @@ describe("onFleetManagerStarted", () => {
     expect(callback).not.toHaveBeenCalled();
   });
 
+  it("fires at most once per instance across stop/start", async () => {
+    const callback = vi.fn();
+    onFleetManagerStarted(callback);
+
+    const manager = await startManager();
+    await manager.stop();
+    // A stopped fleet has to be re-initialized before it can start again.
+    await manager.initialize();
+    await manager.start();
+
+    expect(callback).toHaveBeenCalledTimes(1);
+    await manager.stop();
+  });
+
   it("keeps starting when a callback throws", async () => {
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const afterThrower = vi.fn();

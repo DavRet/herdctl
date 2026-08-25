@@ -41,6 +41,7 @@ import {
 import {
   extractRunUsage,
   extractSummary,
+  isErrorResult,
   isTerminalMessage,
   processSDKMessage,
 } from "./message-processor.js";
@@ -52,6 +53,7 @@ import type {
   RunnerResult,
   SDKMessage,
 } from "./types.js";
+import { DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
 
 // =============================================================================
 // Types
@@ -181,6 +183,10 @@ export class JobExecutor {
     let lastError: RunnerError | undefined;
     let errorDetails: RunnerErrorDetails | undefined;
     let messagesReceived = 0;
+    // Set when a caller interrupts the run through its session handle — the run
+    // is then recorded as cancelled rather than failed.
+    let interrupted = false;
+    const sessionTimeoutMs = options.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS;
     let outputLogPath: string | undefined;
 
     // Determine trigger type: use 'fork' if forking, otherwise use provided or default to 'manual'
@@ -445,7 +451,20 @@ export class JobExecutor {
       // Session-backed runs hold the handle here so the retry paths and the
       // finally below can tear it down; the `execute()` path leaves it undefined.
       let session: RuntimeSession | undefined;
+      // Whether the run is still consuming its input queue. Flipped to false
+      // SYNCHRONOUSLY the moment the drain loop stops, before any await: pushing
+      // into an ended MessageQueue is a silent no-op, so a `send` that lands in
+      // the teardown window must report false rather than pretend delivery.
+      let acceptingInput = false;
+      let timedOut = false;
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+
       const closeSession = async (): Promise<void> => {
+        acceptingInput = false;
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          drainTimer = undefined;
+        }
         const open = session;
         session = undefined;
         if (!open) return;
@@ -455,6 +474,15 @@ export class JobExecutor {
           this.logger.warn(`Failed to close session: ${(closeError as Error).message}`);
         }
       };
+
+      const timeoutError = (): SDKStreamingError =>
+        new SDKStreamingError(
+          buildErrorMessage(
+            `Session-backed run produced no terminal result within sessionTimeoutMs (${sessionTimeoutMs}ms); session closed`,
+            { jobId: job.id, agentName: agent.name },
+          ),
+          { jobId: job.id, agentName: agent.name, code: "SESSION_TIMEOUT", messagesReceived },
+        );
 
       try {
         let messages: AsyncIterable<SDKMessage>;
@@ -491,7 +519,40 @@ export class JobExecutor {
 
             const opened = openSession({ ...runtimeOptions, abortController: sessionAbort });
             session = opened;
-            options.onSessionOpen?.(opened);
+            acceptingInput = true;
+
+            // Stuck-run backstop: the stream never ends by itself, so without
+            // this a missing terminal result drains forever and never releases
+            // the job's concurrency slot. Closing the session ends the stream,
+            // which is what unblocks the loop below.
+            drainTimer = setTimeout(() => {
+              timedOut = true;
+              void closeSession();
+            }, sessionTimeoutMs);
+            drainTimer.unref?.();
+
+            options.onSessionOpen?.({
+              send: (text) => {
+                if (!acceptingInput || !session) return false;
+                void session.send(text).catch((sendError) => {
+                  this.logger.warn(`Failed to send into session: ${(sendError as Error).message}`);
+                });
+                return true;
+              },
+              interrupt: () => {
+                if (!acceptingInput || !session) return false;
+                // Recorded as a cancellation, not a failure: the operator asked
+                // for this ending. The interrupt's terminal message breaks the
+                // drain loop, so the run really does end here.
+                interrupted = true;
+                void session.interrupt().catch((interruptError) => {
+                  this.logger.warn(
+                    `Failed to interrupt session: ${(interruptError as Error).message}`,
+                  );
+                });
+                return true;
+              },
+            });
             messages = opened.messages;
           } else {
             messages = this.runtime.execute(runtimeOptions);
@@ -610,6 +671,11 @@ export class JobExecutor {
 
           // Check for terminal messages
           if (isTerminalMessage(sdkMessage)) {
+            // Stop accepting input synchronously — before the break and before
+            // any await — so no caller can be told a message was delivered into
+            // a queue this run will never read again.
+            acceptingInput = false;
+
             if (sdkMessage.type === "error") {
               const errorMessage = (sdkMessage.message as string) ?? "Agent execution failed";
               lastError = new SDKStreamingError(
@@ -624,9 +690,36 @@ export class JobExecutor {
                   messagesReceived,
                 },
               );
+            } else if (isErrorResult(sdkMessage)) {
+              // A `result` can report failure without being an `error` message:
+              // `is_error`, or any subtype other than "success" (max turns,
+              // error_during_execution, an interrupted turn). Treating those as
+              // completed reported broken runs as green — same semantics the
+              // message processor already applies to the output record.
+              const resultMessage = sdkMessage as { subtype?: string; result?: string };
+              lastError = new SDKStreamingError(
+                buildErrorMessage(
+                  resultMessage.result ??
+                    `Agent run ended with result subtype "${resultMessage.subtype ?? "unknown"}"`,
+                  { jobId: job.id, agentName: agent.name },
+                ),
+                {
+                  jobId: job.id,
+                  agentName: agent.name,
+                  code: resultMessage.subtype,
+                  messagesReceived,
+                },
+              );
             }
             break;
           }
+        }
+
+        // The timeout closed the session, which can end the stream cleanly
+        // instead of throwing — record the real cause rather than a silent
+        // "completed with no result".
+        if (timedOut && !lastError) {
+          lastError = timeoutError();
         }
 
         // Post-loop session-not-found retry (issue #126).
@@ -746,12 +839,16 @@ export class JobExecutor {
           return;
         }
 
-        // Wrap the error with context if not already a RunnerError
-        lastError = wrapError(error, {
-          jobId: job.id,
-          agentName: agent.name,
-          phase: messagesReceived === 0 ? "init" : "streaming",
-        });
+        // Wrap the error with context if not already a RunnerError. A timeout
+        // surfaces here as the abort the session's close() raised — report the
+        // timeout, not the abort it caused.
+        lastError = timedOut
+          ? timeoutError()
+          : wrapError(error, {
+              jobId: job.id,
+              agentName: agent.name,
+              phase: messagesReceived === 0 ? "init" : "streaming",
+            });
 
         // Add messages received count for streaming errors
         if (lastError instanceof SDKStreamingError && messagesReceived > 0) {
@@ -825,17 +922,20 @@ export class JobExecutor {
     // A run that was aborted mid-flight (cancelJob → AbortController) is recorded
     // as "cancelled", not "failed": the CLI runtime surfaces the kill as a
     // terminal error, but that's an intentional cancellation, not a failure.
-    const aborted = options.abortController?.signal.aborted ?? false;
-    const success = !lastError && !aborted;
+    // An operator-requested interrupt counts as a cancellation for the same
+    // reason an abort does: the run was stopped on purpose, so its terminal
+    // error is an intended ending, not a failure.
+    const cancelled = (options.abortController?.signal.aborted ?? false) || interrupted;
+    const success = !lastError && !cancelled;
     const finishedAt = new Date().toISOString();
 
     // Determine status + exit reason: cancelled > success > failed.
-    const status: "completed" | "failed" | "cancelled" = aborted
+    const status: "completed" | "failed" | "cancelled" = cancelled
       ? "cancelled"
       : success
         ? "completed"
         : "failed";
-    const exitReason = aborted ? "cancelled" : success ? "success" : classifyError(lastError!);
+    const exitReason = cancelled ? "cancelled" : success ? "success" : classifyError(lastError!);
 
     try {
       await updateJob(jobsDir, job.id, {

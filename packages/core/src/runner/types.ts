@@ -12,6 +12,16 @@ import type { JobMetadata, JobOutputInput, TriggerType } from "../state/index.js
 // =============================================================================
 
 /**
+ * Default ceiling for a session-backed run (2 hours).
+ *
+ * Deliberately generous: it is a stuck-run backstop, not a work budget. Long
+ * foreground builds run 30–60 min, so anything tighter would kill real work;
+ * anything looser leaves a wedged session holding its concurrency slot for most
+ * of a day. Override per run with {@link RunnerOptions.sessionTimeoutMs}.
+ */
+export const DEFAULT_SESSION_TIMEOUT_MS = 2 * 60 * 60_000;
+
+/**
  * Options for running an agent
  */
 export interface RunnerOptions {
@@ -65,11 +75,44 @@ export interface RunnerOptions {
    */
   interactive?: boolean;
   /**
-   * Called once with the live session handle when {@link interactive} actually
-   * took effect. Never called on the `execute()` path. The handle is only valid
-   * until the run ends; the executor closes it.
+   * Ceiling for a session-backed run, in milliseconds (default
+   * {@link DEFAULT_SESSION_TIMEOUT_MS}).
+   *
+   * A streaming session's message stream never ends on its own, so a run whose
+   * terminal `result` never arrives would drain forever: the job stays
+   * `running`, its concurrency slot is never released and its `claude` process
+   * is never reaped. On expiry the session is closed and the run is recorded as
+   * failed. Ignored on the one-shot `execute()` path, which ends by itself.
    */
-  onSessionOpen?: (session: import("./runtime/index.js").RuntimeSession) => void;
+  sessionTimeoutMs?: number;
+  /**
+   * Called once with a control handle when {@link interactive} actually took
+   * effect. Never called on the `execute()` path.
+   *
+   * Deliberately NOT the raw `RuntimeSession`: the executor owns the session's
+   * lifetime, so a caller must not be able to `close()` it or consume its
+   * message stream.
+   */
+  onSessionOpen?: (handle: JobSessionHandle) => void;
+}
+
+/**
+ * What a caller may do with a *running* session-backed job.
+ *
+ * Both methods are synchronous and report whether the run was still accepting
+ * input at the moment of the call — `false` means the run has stopped consuming
+ * its input queue (terminal message seen, timed out, or already torn down), so
+ * the text would have been silently dropped.
+ */
+export interface JobSessionHandle {
+  /** Queue a user turn. The runtime delivers it at the current turn's next tool boundary. */
+  send(text: string): boolean;
+  /**
+   * Interrupt the running turn. The run ENDS (its terminal message breaks the
+   * drain loop and the executor closes the session) and is recorded as
+   * `cancelled` — this is not "pause and continue".
+   */
+  interrupt(): boolean;
 }
 
 /**

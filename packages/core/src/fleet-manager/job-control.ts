@@ -15,6 +15,7 @@ import {
   countPendingAsyncQueueEntries,
   getCliSessionFile,
   JobExecutor,
+  type JobSessionHandle,
   RuntimeFactory,
   type RuntimeSession,
   SDKRuntime,
@@ -76,51 +77,45 @@ const DEFAULT_RESUME_DEFER_TIMEOUT_MS = 5 * 60_000;
  */
 export class JobControl {
   /**
-   * Live streaming sessions of session-backed trigger jobs, keyed by job id.
+   * Control handles for session-backed trigger jobs running here, keyed by job id.
    *
    * Sibling of the AbortController registry (`ctx.registerJob`), but kept local:
    * only {@link trigger} creates these, and only {@link sendToJob} /
-   * {@link interruptJob} consume them. Entries are added when the session opens
-   * and removed in `trigger`'s finally, so a lookup miss means "not running, or
-   * not session-backed" — exactly what the public API reports as `false`.
+   * {@link interruptJob} consume them. The handle — not the raw session — is
+   * stored on purpose: the executor owns the session's lifetime, and the handle
+   * reports (synchronously) whether the run is still reading its input, so a
+   * message can never be reported delivered into a queue that has stopped being
+   * drained.
    */
-  private readonly runningSessions = new Map<string, RuntimeSession>();
+  private readonly runningSessions = new Map<string, JobSessionHandle>();
 
   constructor(private ctx: FleetManagerContext) {}
 
   /**
    * Push a user message into a running session-backed job.
    *
-   * @returns `false` when no such job is running **in this process** or the job
-   *   is not session-backed (`interactive` was not set / the runtime has no
-   *   streaming sessions). `true` means the message was queued — the SDK
-   *   delivers it at the running turn's next tool boundary, so delivery is not
-   *   instantaneous.
+   * @returns `false` when no such job is running **in this process**, the job is
+   *   not session-backed (`interactive` was not set / the runtime has no
+   *   streaming sessions), or the run has already stopped reading its input.
+   *   `true` means the message was queued — the runtime delivers it at the
+   *   running turn's next tool boundary, so delivery is not instantaneous.
    */
   sendToJob(jobId: string, text: string): boolean {
-    const session = this.runningSessions.get(jobId);
-    if (!session) return false;
-    // Fire-and-forget: the queue push is synchronous inside the SDK session; we
-    // only guard against a rejected promise crashing the process.
-    void session.send(text).catch((error) => {
-      this.ctx.getLogger().warn(`Failed to send to job ${jobId}: ${(error as Error).message}`);
-    });
-    return true;
+    return this.runningSessions.get(jobId)?.send(text) ?? false;
   }
 
   /**
-   * Interrupt the current turn of a running session-backed job without closing
-   * it — further {@link sendToJob} calls stay valid.
+   * Interrupt the current turn of a running session-backed job.
+   *
+   * This ENDS the run: the interrupt's terminal message breaks the executor's
+   * drain loop, the session is closed, and the job is recorded as `cancelled`.
+   * It is not "pause and resume" — for that, a job would have to outlive its
+   * terminal message, which the executor deliberately does not allow.
    *
    * @returns `false` under the same conditions as {@link sendToJob}.
    */
   interruptJob(jobId: string): boolean {
-    const session = this.runningSessions.get(jobId);
-    if (!session) return false;
-    void session.interrupt().catch((error) => {
-      this.ctx.getLogger().warn(`Failed to interrupt job ${jobId}: ${(error as Error).message}`);
-    });
-    return true;
+    return this.runningSessions.get(jobId)?.interrupt() ?? false;
   }
 
   /**
@@ -328,10 +323,11 @@ export class JobControl {
         resume: sessionId,
         sessionKey: options?.sessionKey,
         interactive: options?.interactive,
+        sessionTimeoutMs: options?.sessionTimeoutMs,
         // Only fires when the run really is session-backed; register the handle
         // so sendToJob/interruptJob can reach this job while it runs.
-        onSessionOpen: (session) => {
-          if (registeredJobId) this.runningSessions.set(registeredJobId, session);
+        onSessionOpen: (handle) => {
+          if (registeredJobId) this.runningSessions.set(registeredJobId, handle);
         },
         fork: options?.fork,
         forkedFrom: options?.forkedFrom,

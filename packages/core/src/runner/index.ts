@@ -35,6 +35,7 @@ export {
 // Export message processor functions
 export {
   extractSummary,
+  isErrorResult,
   isTerminalMessage,
   processSDKMessage,
 } from "./message-processor.js";
@@ -73,10 +74,10 @@ export {
   transformMcpServer,
   transformMcpServers,
 } from "./sdk-adapter.js";
-// Export types
 export type {
   InjectedMcpServerDef,
   InjectedMcpToolDef,
+  JobSessionHandle,
   McpToolCallResult,
   MessageCallback,
   ProcessedMessage,
@@ -89,3 +90,5 @@ export type {
   SDKQueryOptions,
   SDKSystemPrompt,
 } from "./types.js";
+// Export types
+export { DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";

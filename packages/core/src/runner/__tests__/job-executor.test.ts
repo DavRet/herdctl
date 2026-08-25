@@ -11,7 +11,7 @@ import {
   updateSessionInfo,
 } from "../../state/index.js";
 import { executeJob, JobExecutor } from "../job-executor.js";
-import type { SDKMessage } from "../types.js";
+import type { JobSessionHandle, SDKMessage } from "../types.js";
 
 // =============================================================================
 // Test Helpers
@@ -2602,35 +2602,61 @@ describe("session expiration handling", () => {
  * Mock runtime that implements `openSession`. The session yields the supplied
  * messages, records every injected turn, and reports whether it was closed.
  */
-function createMockSessionRuntime(messages: SDKMessage[]) {
+function createMockSessionRuntime(messages: SDKMessage[], options: { hang?: boolean } = {}) {
   const sent: string[] = [];
-  const state = { opened: 0, closed: 0, sent, lastOptions: undefined as any };
+  const state = {
+    opened: 0,
+    closed: 0,
+    interrupted: 0,
+    sent,
+    lastOptions: undefined as any,
+    /** Resolves once the session stream is exhausted, so tests can await teardown. */
+    streamDrained: undefined as Promise<void> | undefined,
+  };
+
+  let closeStream: (() => void) | undefined;
 
   const runtime: any = {
     execute: async function* () {
       throw new Error("execute() must not be used when openSession() is available");
     },
-    openSession: (options: any) => {
+    openSession: (sessionOptions: any) => {
       state.opened++;
-      state.lastOptions = options;
+      state.lastOptions = sessionOptions;
       return {
         messages: (async function* () {
           for (const message of messages) {
             yield message;
           }
           // A real session's stream does not end after the result — it stays
-          // open until close(). Block forever so a missing terminal-break in the
-          // executor hangs the test instead of passing by accident.
-          await new Promise(() => {});
+          // open until close(). Block until close() so a missing terminal-break
+          // in the executor hangs the test instead of passing by accident.
+          await new Promise<void>((resolve, reject) => {
+            closeStream = resolve;
+            // Mirror the real runtime: close() aborts the session controller and
+            // the underlying query stream rejects.
+            sessionOptions.abortController?.signal.addEventListener(
+              "abort",
+              () => reject(new Error("The operation was aborted")),
+              { once: true },
+            );
+          });
         })(),
         send: async (text: string) => {
           sent.push(text);
         },
-        interrupt: async () => {},
+        interrupt: async () => {
+          state.interrupted++;
+        },
         listCommands: async () => [],
         setModel: async () => {},
         close: async () => {
           state.closed++;
+          // The real close() ends the input queue, returns the generator, then
+          // aborts as a backstop. A "hanging" session only dies on that abort —
+          // the wedged-subprocess case the timeout must still recover from.
+          if (!options.hang) closeStream?.();
+          sessionOptions.abortController?.abort();
         },
       };
     },
@@ -2739,5 +2765,206 @@ describe("JobExecutor session-backed jobs", () => {
 
     expect(result.success).toBe(true);
     expect(state.opened).toBe(0);
+  });
+});
+
+describe("JobExecutor session-backed failure and control paths", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("fails the job when no terminal result arrives before sessionTimeoutMs", async () => {
+    // Only an init message — the terminal result never comes.
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "stuck-session" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "stuck-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      sessionTimeoutMs: 50,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.errorDetails?.message).toMatch(/sessionTimeoutMs/);
+    expect(state.closed).toBeGreaterThanOrEqual(1);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
+  });
+
+  it("recovers from a session that only dies on abort", async () => {
+    const { runtime } = createMockSessionRuntime(
+      [{ type: "system", subtype: "init", session_id: "wedged" } as SDKMessage],
+      { hang: true },
+    );
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "wedged-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      sessionTimeoutMs: 50,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.errorDetails?.message).toMatch(/sessionTimeoutMs/);
+  });
+
+  it("fails a job whose result reports is_error", async () => {
+    const { runtime } = createMockSessionRuntime([
+      { type: "result", subtype: "success", is_error: true, result: "tool blew up" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "is-error-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(result.success).toBe(false);
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
+  });
+
+  it("fails a job whose result subtype is not success", async () => {
+    const runtime = createMockRuntimeWithMessages([
+      { type: "result", subtype: "error_max_turns" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "max-turns-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+    });
+
+    expect(result.success).toBe(false);
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
+    expect(job?.exit_reason).not.toBe("success");
+  });
+
+  it("records an interrupted run as cancelled, not failed", async () => {
+    // The interrupt lands while the run is streaming; the runtime answers with
+    // the terminal error result a real interrupt produces.
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "interrupt-me" } as SDKMessage,
+      { type: "result", subtype: "error_during_execution", is_error: true } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "interrupted-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      onSessionOpen: (handle) => {
+        expect(handle.interrupt()).toBe(true);
+      },
+    });
+
+    expect(state.interrupted).toBe(1);
+    expect(result.success).toBe(false);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("cancelled");
+    expect(job?.exit_reason).toBe("cancelled");
+  });
+
+  it("stops accepting input once the terminal message arrives", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "closing" } as SDKMessage,
+      { type: "result", subtype: "success", result: "done" } as SDKMessage,
+    ]);
+
+    let handle: JobSessionHandle | undefined;
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "teardown-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      onSessionOpen: (h) => {
+        handle = h;
+        // Still live at this point.
+        expect(h.send("early")).toBe(true);
+      },
+    });
+
+    expect(result.success).toBe(true);
+    // After the terminal message the queue is no longer drained, so a send must
+    // report false rather than silently dropping the text.
+    expect(handle?.send("late")).toBe(false);
+    expect(handle?.interrupt()).toBe(false);
+    expect(state.sent).toEqual(["early"]);
+  });
+
+  it("records an aborted session-backed run as cancelled and closes the session", async () => {
+    const abortController = new AbortController();
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "abort-me" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const run = executor.execute({
+      agent: createTestAgent({ name: "aborted-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      abortController,
+      sessionTimeoutMs: 10_000,
+    });
+
+    // The job's abort is forwarded into the session, ending its stream.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    abortController.abort();
+
+    const result = await run;
+    expect(result.success).toBe(false);
+    expect(state.closed).toBeGreaterThanOrEqual(1);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("cancelled");
+  });
+
+  it("closes the failed session before retrying after session expiry", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "error", message: "No conversation found with session ID: abc" } as SDKMessage,
+    ]);
+
+    await updateSessionInfo(join(stateDir, "sessions"), "retry-agent", {
+      session_id: "abc",
+      mode: "autonomous",
+    });
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    await executor.execute({
+      agent: createTestAgent({ name: "retry-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      resume: "abc",
+    });
+
+    // Two sessions opened (original + retry), and both were closed.
+    expect(state.opened).toBe(2);
+    expect(state.closed).toBe(2);
   });
 });
