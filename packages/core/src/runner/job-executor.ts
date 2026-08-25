@@ -53,7 +53,7 @@ import type {
   RunnerResult,
   SDKMessage,
 } from "./types.js";
-import { DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
+import { DEFAULT_INJECTION_GRACE_MS, DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
 
 // =============================================================================
 // Types
@@ -187,6 +187,7 @@ export class JobExecutor {
     // is then recorded as cancelled rather than failed.
     let interrupted = false;
     const sessionTimeoutMs = options.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS;
+    const injectionGraceMs = options.injectionGraceMs ?? DEFAULT_INJECTION_GRACE_MS;
     let outputLogPath: string | undefined;
 
     // Determine trigger type: use 'fork' if forking, otherwise use provided or default to 'manual'
@@ -458,9 +459,40 @@ export class JobExecutor {
       let acceptingInput = false;
       let timedOut = false;
       let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      // Messages handed to the session that no turn has answered yet. Nonzero
+      // means the drain loop must survive the next terminal result (see there).
+      let pendingInjected = 0;
+      // Set when the grace window below expired: an expected ending, not a
+      // failure, so the last result's outcome stands.
+      let graceClosed = false;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const clearGrace = (): void => {
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          graceTimer = undefined;
+        }
+      };
+
+      // Bound the wait for the follow-up turn. A host that folded the injected
+      // message into the turn that just ended will never produce a second
+      // result, so without this the run would idle until sessionTimeoutMs.
+      const armInjectionGrace = (): void => {
+        clearGrace();
+        graceTimer = setTimeout(() => {
+          graceClosed = true;
+          acceptingInput = false;
+          this.logger.warn(
+            `Job ${job.id}: no follow-up turn within ${injectionGraceMs}ms after injected input — closing session (the message may have been folded into the previous turn)`,
+          );
+          void closeSession();
+        }, injectionGraceMs);
+        graceTimer.unref?.();
+      };
 
       const closeSession = async (): Promise<void> => {
         acceptingInput = false;
+        clearGrace();
         if (drainTimer) {
           clearTimeout(drainTimer);
           drainTimer = undefined;
@@ -535,6 +567,7 @@ export class JobExecutor {
             options.onSessionOpen?.({
               send: (text) => {
                 if (!acceptingInput || !session) return false;
+                pendingInjected++;
                 void session.send(text).catch((sendError) => {
                   this.logger.warn(`Failed to send into session: ${(sendError as Error).message}`);
                 });
@@ -575,6 +608,8 @@ export class JobExecutor {
 
         for await (const sdkMessage of messages) {
           messagesReceived++;
+          // The follow-up turn is producing output — stop counting down.
+          clearGrace();
 
           // Process the message safely (handles malformed responses)
           let processed: ProcessedMessage | undefined;
@@ -672,12 +707,9 @@ export class JobExecutor {
 
           // Check for terminal messages
           if (isTerminalMessage(sdkMessage)) {
-            // Stop accepting input synchronously — before the break and before
-            // any await — so no caller can be told a message was delivered into
-            // a queue this run will never read again.
-            acceptingInput = false;
-
             if (sdkMessage.type === "error") {
+              // A stream-level error is always the end — no further turn runs.
+              acceptingInput = false;
               const errorMessage = (sdkMessage.message as string) ?? "Agent execution failed";
               lastError = new SDKStreamingError(
                 buildErrorMessage(errorMessage, {
@@ -691,12 +723,20 @@ export class JobExecutor {
                   messagesReceived,
                 },
               );
-            } else if (isErrorResult(sdkMessage)) {
-              // A `result` can report failure without being an `error` message:
-              // `is_error`, or any subtype other than "success" (max turns,
-              // error_during_execution, an interrupted turn). Treating those as
-              // completed reported broken runs as green — same semantics the
-              // message processor already applies to the output record.
+              break;
+            }
+
+            // A `result` can report failure without being an `error` message:
+            // `is_error`, or any subtype other than "success" (max turns,
+            // error_during_execution, an interrupted turn). Treating those as
+            // completed reported broken runs as green — same semantics the
+            // message processor already applies to the output record.
+            //
+            // Recomputed per result (not just set): with an injected follow-up
+            // turn the run can produce several, and the job's outcome is the
+            // LAST one — an interrupted first turn followed by a clean second
+            // must not leave the job failed.
+            if (isErrorResult(sdkMessage)) {
               const resultMessage = sdkMessage as { subtype?: string; result?: string };
               lastError = new SDKStreamingError(
                 buildErrorMessage(
@@ -711,7 +751,31 @@ export class JobExecutor {
                   messagesReceived,
                 },
               );
+            } else {
+              lastError = undefined;
             }
+
+            if (pendingInjected > 0) {
+              // Injected input is still queued behind this turn. Hosts differ on
+              // when they deliver a pushed streaming-input message: some fold it
+              // into the running turn at a tool boundary, others start a NEW turn
+              // for it after the current one ends (observed on claude 2.1.220,
+              // AI-406). Breaking here closes the session out from under that
+              // second turn and the message is lost — the caller was already told
+              // it was delivered. So keep draining for one more result.
+              //
+              // Counting results, not user-echo events: whether a pushed message
+              // is echoed back into the stream is host-specific and unverified,
+              // while "a result ends a turn" holds everywhere. One extra turn
+              // covers every message queued so far; anything injected during that
+              // turn raises the counter again and earns another.
+              pendingInjected = 0;
+              armInjectionGrace();
+              continue;
+            }
+
+            // Nothing pending: this really is the end.
+            acceptingInput = false;
             break;
           }
         }
@@ -845,11 +909,19 @@ export class JobExecutor {
         // timeout, not the abort it caused.
         lastError = timedOut
           ? timeoutError()
-          : wrapError(error, {
-              jobId: job.id,
-              agentName: agent.name,
-              phase: messagesReceived === 0 ? "init" : "streaming",
-            });
+          : graceClosed
+            ? // The grace window closed the session on purpose; the abort it
+              // raised is the mechanism, not the outcome. Keep the last result's.
+              lastError
+            : wrapError(error, {
+                jobId: job.id,
+                agentName: agent.name,
+                phase: messagesReceived === 0 ? "init" : "streaming",
+              });
+
+        // A grace-window close can leave no error at all — the run ended
+        // normally on its last result and there is nothing to report.
+        if (!lastError) return;
 
         // Add messages received count for streaming errors
         if (lastError instanceof SDKStreamingError && messagesReceived > 0) {

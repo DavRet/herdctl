@@ -11,6 +11,7 @@ import {
   updateSessionInfo,
 } from "../../state/index.js";
 import { executeJob, JobExecutor } from "../job-executor.js";
+import { MessageQueue } from "../runtime/message-queue.js";
 import type { JobSessionHandle, SDKMessage } from "../types.js";
 
 // =============================================================================
@@ -2602,19 +2603,23 @@ describe("session expiration handling", () => {
  * Mock runtime that implements `openSession`. The session yields the supplied
  * messages, records every injected turn, and reports whether it was closed.
  */
-function createMockSessionRuntime(messages: SDKMessage[], options: { hang?: boolean } = {}) {
+function createMockSessionRuntime(
+  messages: SDKMessage[],
+  options: {
+    hang?: boolean;
+    /** Push follow-up stream messages when the caller injects a turn. */
+    onSend?: (text: string, queue: MessageQueue<SDKMessage>) => void;
+  } = {},
+) {
   const sent: string[] = [];
-  const state = {
-    opened: 0,
-    closed: 0,
-    interrupted: 0,
-    sent,
-    lastOptions: undefined as any,
-    /** Resolves once the session stream is exhausted, so tests can await teardown. */
-    streamDrained: undefined as Promise<void> | undefined,
-  };
+  const state = { opened: 0, closed: 0, interrupted: 0, sent, lastOptions: undefined as any };
 
-  let closeStream: (() => void) | undefined;
+  // A real session's stream does not end after a result — it stays open until
+  // close(). MessageQueue gives exactly that: it blocks until more is pushed or
+  // the queue ends, so a missing terminal-break hangs the test instead of
+  // passing by accident, and a follow-up turn can be delivered mid-drain.
+  const queue = new MessageQueue<SDKMessage>();
+  for (const message of messages) queue.push(message);
 
   const runtime: any = {
     execute: async function* () {
@@ -2625,25 +2630,27 @@ function createMockSessionRuntime(messages: SDKMessage[], options: { hang?: bool
       state.lastOptions = sessionOptions;
       return {
         messages: (async function* () {
-          for (const message of messages) {
-            yield message;
-          }
-          // A real session's stream does not end after the result — it stays
-          // open until close(). Block until close() so a missing terminal-break
-          // in the executor hangs the test instead of passing by accident.
-          await new Promise<void>((resolve, reject) => {
-            closeStream = resolve;
-            // Mirror the real runtime: close() aborts the session controller and
-            // the underlying query stream rejects.
+          // Mirror the real runtime: close() aborts the session controller and
+          // the underlying query stream rejects.
+          const aborted = new Promise<never>((_resolve, reject) => {
             sessionOptions.abortController?.signal.addEventListener(
               "abort",
               () => reject(new Error("The operation was aborted")),
               { once: true },
             );
           });
+          aborted.catch(() => {});
+
+          const iterator = queue[Symbol.asyncIterator]();
+          for (;;) {
+            const next = await Promise.race([iterator.next(), aborted]);
+            if (next.done) return;
+            yield next.value;
+          }
         })(),
         send: async (text: string) => {
           sent.push(text);
+          options.onSend?.(text, queue);
         },
         interrupt: async () => {
           state.interrupted++;
@@ -2652,17 +2659,16 @@ function createMockSessionRuntime(messages: SDKMessage[], options: { hang?: bool
         setModel: async () => {},
         close: async () => {
           state.closed++;
-          // The real close() ends the input queue, returns the generator, then
-          // aborts as a backstop. A "hanging" session only dies on that abort —
-          // the wedged-subprocess case the timeout must still recover from.
-          if (!options.hang) closeStream?.();
+          // A "hanging" session ignores the input close and only dies on the
+          // abort — the wedged-subprocess case the timeout must recover from.
+          if (!options.hang) queue.end();
           sessionOptions.abortController?.abort();
         },
       };
     },
   };
 
-  return { runtime, state };
+  return { runtime, state, queue };
 }
 
 describe("JobExecutor session-backed jobs", () => {
@@ -2901,6 +2907,7 @@ describe("JobExecutor session-backed failure and control paths", () => {
       prompt: "Test prompt",
       stateDir,
       interactive: true,
+      injectionGraceMs: 20,
       onSessionOpen: (h) => {
         handle = h;
         // Still live at this point.
@@ -2966,5 +2973,119 @@ describe("JobExecutor session-backed failure and control paths", () => {
     // Two sessions opened (original + retry), and both were closed.
     expect(state.opened).toBe(2);
     expect(state.closed).toBe(2);
+  });
+});
+
+describe("JobExecutor injected-input drain (AI-406)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("keeps draining when the host answers injected input in a NEXT turn", async () => {
+    // Host behaviour observed on claude 2.1.220: the pushed message does not
+    // join the running turn, it starts its own once the first one has ended.
+    const { runtime, state } = createMockSessionRuntime(
+      [
+        { type: "system", subtype: "init", session_id: "next-turn" } as SDKMessage,
+        { type: "result", subtype: "success", result: "first turn" } as SDKMessage,
+      ],
+      {
+        onSend: (text, queue) => {
+          queue.push({ type: "assistant", content: `acting on: ${text}` });
+          queue.push({ type: "result", subtype: "success", result: "second turn" } as SDKMessage);
+        },
+      },
+    );
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "next-turn-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 5_000,
+      onSessionOpen: (handle) => {
+        expect(handle.send("do this instead")).toBe(true);
+      },
+    });
+
+    expect(state.sent).toEqual(["do this instead"]);
+    expect(result.success).toBe(true);
+    // The job's outcome is the LAST result, not the one that ended turn one.
+    expect(result.summary).toBe("second turn");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("recovers a failed first turn when the injected turn succeeds", async () => {
+    const { runtime } = createMockSessionRuntime(
+      [{ type: "result", subtype: "error_during_execution", is_error: true } as SDKMessage],
+      {
+        onSend: (_text, queue) => {
+          queue.push({ type: "result", subtype: "success", result: "recovered" } as SDKMessage);
+        },
+      },
+    );
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "recovering-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 5_000,
+      onSessionOpen: (handle) => {
+        handle.send("try again");
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("closes with a warning when no follow-up turn arrives within the grace window", async () => {
+    const warnings: string[] = [];
+    const logger = {
+      ...createMockLogger(),
+      warn: (message: string) => warnings.push(message),
+    };
+
+    // No onSend: the injected message is never answered by a second turn (the
+    // host folded it into the turn that just ended, or dropped it).
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "no-follow-up" } as SDKMessage,
+      { type: "result", subtype: "success", result: "only turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "grace-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 40,
+      onSessionOpen: (handle) => {
+        handle.send("never answered");
+      },
+    });
+
+    expect(state.closed).toBeGreaterThanOrEqual(1);
+    expect(warnings.some((w) => /no follow-up turn within 40ms/.test(w))).toBe(true);
+    // An expected ending, not a failure: the last result still decides.
+    expect(result.success).toBe(true);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
   });
 });

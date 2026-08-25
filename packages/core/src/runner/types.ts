@@ -22,6 +22,18 @@ import type { JobMetadata, JobOutputInput, TriggerType } from "../state/index.js
 export const DEFAULT_SESSION_TIMEOUT_MS = 2 * 60 * 60_000;
 
 /**
+ * Default wait for the follow-up turn an injected message may start (60s).
+ *
+ * Hosts differ on when a pushed streaming-input message is delivered: some fold
+ * it into the running turn, others start a new turn once the current one ends.
+ * After a terminal result with input still pending, the executor waits this long
+ * for that second turn to produce output. Expiry closes the session — an
+ * expected ending, not a failure, since the message may simply have been
+ * answered by the turn that just finished.
+ */
+export const DEFAULT_INJECTION_GRACE_MS = 60_000;
+
+/**
  * Options for running an agent
  */
 export interface RunnerOptions {
@@ -85,6 +97,13 @@ export interface RunnerOptions {
    * failed. Ignored on the one-shot `execute()` path, which ends by itself.
    */
   sessionTimeoutMs?: number;
+  /**
+   * How long a session-backed run waits, after a terminal result, for the
+   * follow-up turn that injected input may start (default
+   * {@link DEFAULT_INJECTION_GRACE_MS}). Only consulted when a message was
+   * injected and no turn has answered it yet.
+   */
+  injectionGraceMs?: number;
   /**
    * Called once with a control handle when {@link interactive} actually took
    * effect. Never called on the `execute()` path.

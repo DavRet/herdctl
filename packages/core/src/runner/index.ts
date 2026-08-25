@@ -92,4 +92,4 @@ export type {
   SDKSystemPrompt,
 } from "./types.js";
 // Export types
-export { DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
+export { DEFAULT_INJECTION_GRACE_MS, DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
