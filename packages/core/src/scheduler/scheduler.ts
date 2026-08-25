@@ -5,6 +5,7 @@
  * due agents according to their configured schedules.
  */
 
+import { randomUUID } from "node:crypto";
 import type { ResolvedAgent } from "../config/index.js";
 import { createLogger } from "../utils/logger.js";
 import {
@@ -593,6 +594,50 @@ export class Scheduler {
    */
   getRunningJobCount(agentName: string): number {
     return this.runningSchedules.get(agentName)?.size ?? 0;
+  }
+
+  /**
+   * Atomically reserve a concurrency slot for a job that is NOT schedule-fired
+   * (i.e. `FleetManager.trigger()`), so trigger jobs and schedule jobs share one
+   * capacity budget.
+   *
+   * Trigger jobs used to bypass the budget entirely: `getRunningJobCount()` reads
+   * `runningSchedules`, which only schedule runs ever wrote to, so N parallel
+   * triggers all saw a count of 0 and all ran. Reserving here — synchronously,
+   * with no await between the capacity check and the insert — closes that hole.
+   *
+   * The reservation is stored under an opaque `trigger:<uuid>` token rather than a
+   * schedule name, so it can never collide with (or be deleted by) a schedule run's
+   * own bookkeeping, and `isScheduleRunning()` stays exact.
+   *
+   * @param agentName - Qualified agent name
+   * @param maxConcurrent - Capacity to enforce (agent's `instances.max_concurrent`)
+   * @returns A release token, or `null` if the agent is already at capacity
+   */
+  acquireJobSlot(agentName: string, maxConcurrent: number): string | null {
+    let running = this.runningSchedules.get(agentName);
+    if (!running) {
+      running = new Set();
+      this.runningSchedules.set(agentName, running);
+    }
+
+    if (running.size >= maxConcurrent) {
+      return null;
+    }
+
+    const token = `trigger:${randomUUID()}`;
+    running.add(token);
+    return token;
+  }
+
+  /**
+   * Release a slot reserved via {@link acquireJobSlot}. Idempotent.
+   *
+   * @param agentName - Qualified agent name
+   * @param token - The token returned by `acquireJobSlot`
+   */
+  releaseJobSlot(agentName: string, token: string): void {
+    this.runningSchedules.get(agentName)?.delete(token);
   }
 
   /**
