@@ -13,7 +13,7 @@ export { ConfigReload } from "./config-reload.js";
 // Context interface for module composition
 export type { FleetManagerContext } from "./context.js";
 // Main class
-export { FleetManager } from "./fleet-manager.js";
+export { FleetManager, onFleetManagerStarted } from "./fleet-manager.js";
 export { JobControl } from "./job-control.js";
 export { LogStreaming } from "./log-streaming.js";
 export { ScheduleExecutor } from "./schedule-executor.js";
