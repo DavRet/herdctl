@@ -581,6 +581,16 @@ export interface TriggerOptions {
   resume?: string | null;
 
   /**
+   * Key under which this trigger's session is stored and looked up.
+   *
+   * Defaults to the agent's qualified name (one session per agent). Pass a value
+   * to scope the session narrower — e.g. one session per work item / ticket — so
+   * two concurrent triggers for the same agent do not share a conversation.
+   * Must be a safe file identifier (`[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?`).
+   */
+  sessionKey?: string;
+
+  /**
    * Session ID to FORK for this trigger.
    *
    * When provided, the agent resumes `fork`'s transcript as context but writes
