@@ -39,6 +39,16 @@ export interface RunnerOptions {
   injectedMcpServers?: Record<string, InjectedMcpServerDef>;
   /** Text to append to the agent's system prompt for this run */
   systemPromptAppend?: string;
+  /**
+   * Key under which this run's session is stored and looked up.
+   *
+   * Defaults to `agent.qualifiedName` — one session per agent, the historical
+   * behavior. Pass a different key to scope a session to something narrower than
+   * the agent, e.g. one session per work item. Must be a safe file identifier
+   * (`[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?`); session storage rejects anything
+   * else.
+   */
+  sessionKey?: string;
 }
 
 /**

@@ -25,6 +25,18 @@ import { calculateNextCronTrigger } from "./cron.js";
 import { calculateNextTrigger } from "./interval.js";
 import { type ScheduleStateLogger, updateScheduleState } from "./schedule-state.js";
 
+/**
+ * Coerce an arbitrary string into a safe session-file identifier.
+ *
+ * Work item ids are external (`OWNER/REPO#12`, `PROJ-123`, ...) and session storage
+ * only accepts `[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?`. Unsafe characters become
+ * `-`; leading/trailing separators are trimmed. Collisions between two ids that
+ * normalize identically are possible in theory but not in practice for issue keys.
+ */
+function toSessionKey(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "");
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -293,6 +305,14 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
       }
     }
 
+    // Per-work-item session: when this run is processing a work item, scope the
+    // session to that item instead of the agent, so two items never share (and
+    // pollute) one conversation. Without a work item the key stays the agent's
+    // qualified name, i.e. behavior is unchanged.
+    const sessionKey = workItem
+      ? toSessionKey(`${agent.qualifiedName}--${workItem.id}`)
+      : agent.qualifiedName;
+
     // Step 3: Build the prompt
     const prompt = buildSchedulePrompt(schedule, workItem);
 
@@ -319,7 +339,7 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
         // Use session timeout config for expiry validation to prevent resuming stale sessions
         // Default to 24h if not configured - this prevents unexpected logouts from expired server-side sessions
         const sessionTimeout = agent.session?.timeout ?? "24h";
-        const existingSession = await getSessionInfo(sessionsDir, agent.qualifiedName, {
+        const existingSession = await getSessionInfo(sessionsDir, sessionKey, {
           timeout: sessionTimeout,
           logger,
           runtime: agent.runtime ?? "sdk",
@@ -356,6 +376,7 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
       triggerType: "schedule",
       schedule: scheduleName,
       resume: sessionId,
+      sessionKey,
     });
 
     // Step 7: Report outcome to work source if we processed a work item

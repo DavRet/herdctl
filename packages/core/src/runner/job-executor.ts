@@ -151,6 +151,13 @@ export class JobExecutor {
       outputToFile,
     } = options;
 
+    // Session identity for this run. Defaults to the agent's qualified name (one
+    // session per agent); callers can scope it narrower (e.g. one session per work
+    // item) by passing `sessionKey`. Every session read/write below goes through
+    // this, while the job record keeps `agent.qualifiedName` so jobs stay grouped
+    // by agent regardless of session scoping.
+    const sessionKey = options.sessionKey ?? agent.qualifiedName;
+
     const jobsDir = join(stateDir, "jobs");
     let job: JobMetadata;
     let sessionId: string | undefined;
@@ -228,9 +235,9 @@ export class JobExecutor {
       // issue #263) from "this agent had a session that just expired and was
       // cleared" (must start fresh). The timeout-aware read below deletes expired
       // files, which would otherwise make both cases look identical (null).
-      const hadAgentSession = (await getSessionInfo(sessionsDir, agent.qualifiedName)) !== null;
+      const hadAgentSession = (await getSessionInfo(sessionsDir, sessionKey)) !== null;
 
-      const existingSession = await getSessionInfo(sessionsDir, agent.qualifiedName, {
+      const existingSession = await getSessionInfo(sessionsDir, sessionKey, {
         timeout: sessionTimeout,
         logger: this.logger,
         runtime: agent.runtime ?? "sdk", // Pass runtime for correct validation
@@ -260,7 +267,7 @@ export class JobExecutor {
             `${wdValidation.message} - clearing stale session ${existingSession.session_id}`,
           );
           try {
-            await clearSession(sessionsDir, agent.qualifiedName);
+            await clearSession(sessionsDir, sessionKey);
           } catch (clearError) {
             this.logger.warn(`Failed to clear stale session: ${(clearError as Error).message}`);
           }
@@ -282,7 +289,7 @@ export class JobExecutor {
               `${runtimeValidation.message} - clearing stale session ${existingSession.session_id}`,
             );
             try {
-              await clearSession(sessionsDir, agent.qualifiedName);
+              await clearSession(sessionsDir, sessionKey);
             } catch (clearError) {
               this.logger.warn(`Failed to clear stale session: ${(clearError as Error).message}`);
             }
@@ -299,7 +306,7 @@ export class JobExecutor {
             // Update last_used_at NOW to prevent session from expiring during long-running jobs
             // This fixes the authentication bug where sessions could expire mid-execution
             try {
-              await updateSessionInfo(sessionsDir, agent.qualifiedName, {
+              await updateSessionInfo(sessionsDir, sessionKey, {
                 session_id: existingSession.session_id,
                 job_count: existingSession.job_count,
                 mode: existingSession.mode,
@@ -373,7 +380,7 @@ export class JobExecutor {
           // a failure here doesn't block the resume we're about to attempt.
           try {
             const sessionsDir = join(stateDir, "sessions");
-            await updateSessionInfo(sessionsDir, agent.qualifiedName, {
+            await updateSessionInfo(sessionsDir, sessionKey, {
               session_id: options.resume,
               mode: "autonomous",
               working_directory: currentWorkingDirectory,
@@ -594,7 +601,7 @@ export class JobExecutor {
 
           try {
             const sessionsDir = join(stateDir, "sessions");
-            await clearSession(sessionsDir, agent.qualifiedName);
+            await clearSession(sessionsDir, sessionKey);
             this.logger.info?.(`Cleared stale session for ${agent.qualifiedName}`);
           } catch (clearError) {
             this.logger.warn(`Failed to clear stale session: ${(clearError as Error).message}`);
@@ -630,7 +637,7 @@ export class JobExecutor {
           // Clear the expired session
           try {
             const sessionsDir = join(stateDir, "sessions");
-            await clearSession(sessionsDir, agent.qualifiedName);
+            await clearSession(sessionsDir, sessionKey);
             this.logger.info?.(`Cleared expired session for ${agent.qualifiedName}`);
           } catch (clearError) {
             this.logger.warn(`Failed to clear expired session: ${(clearError as Error).message}`);
@@ -788,14 +795,14 @@ export class JobExecutor {
         const sessionsDir = join(stateDir, "sessions");
 
         // Get existing session to determine if updating or creating
-        const existingSession = await getSessionInfo(sessionsDir, agent.qualifiedName, {
+        const existingSession = await getSessionInfo(sessionsDir, sessionKey, {
           runtime: agent.runtime ?? "sdk",
         });
 
         // Store the current working directory with the session
         const currentWorkingDirectory = resolveWorkingDirectory(agent);
 
-        await updateSessionInfo(sessionsDir, agent.qualifiedName, {
+        await updateSessionInfo(sessionsDir, sessionKey, {
           session_id: sessionId,
           job_count: (existingSession?.job_count ?? 0) + 1,
           mode: existingSession?.mode ?? "autonomous",
