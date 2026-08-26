@@ -220,7 +220,15 @@ export class SDKRuntime implements RuntimeInterface {
     // loop is waiting on that same tick).
     let liveBackgroundTasks: BackgroundTaskSummary[] = [];
     const onLifecycleSignal = (signal: SessionLifecycleSignal) => {
-      liveBackgroundTasks = signal.backgroundTasks;
+      // `activity` and `cron_deleted` carry no task snapshot (always `[]`,
+      // see SessionLifecycleSignal's own doc) — only `turn_end` and
+      // `background_tasks_changed` are authoritative. Taking every signal
+      // here would let an `activity` signal (fired on the next assistant
+      // message) wipe a real pending-task count to `[]` and release a held
+      // terminal early.
+      if (signal.kind === "turn_end" || signal.kind === "background_tasks_changed") {
+        liveBackgroundTasks = signal.backgroundTasks;
+      }
     };
     sdkOptions.hooks = {
       ...(sdkOptions.hooks ?? {}),
@@ -305,17 +313,21 @@ export class SDKRuntime implements RuntimeInterface {
           // else: keep looping, still holding.
         }
       }
+
+      // Inside the same try/finally as the loop above (not after it): a
+      // `yield` suspends the generator, and if the consumer aborts iteration
+      // right here (breaks its `for await`, calls `.return()`) without this
+      // being in the try, the `finally` below — and therefore input.end()/
+      // q.return() — would never run, leaking the query.
+      if (pendingTerminal) yield pendingTerminal;
     } finally {
       if (ceilingTimer) clearTimeout(ceilingTimer);
-    }
-
-    if (pendingTerminal) yield pendingTerminal;
-
-    input.end();
-    try {
-      await q.return(undefined);
-    } catch {
-      // Already closed / never started — nothing to clean up.
+      input.end();
+      try {
+        await q.return(undefined);
+      } catch {
+        // Already closed / never started — nothing to clean up.
+      }
     }
   }
 

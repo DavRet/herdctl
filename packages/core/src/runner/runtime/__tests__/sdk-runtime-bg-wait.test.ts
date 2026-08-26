@@ -11,9 +11,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 type FakeMessage = Record<string, unknown>;
 
 // A controllable async generator standing in for the SDK's query() stream.
-// The queue is fed by the test; `query()` returns an object whose
-// `[Symbol.asyncIterator]` walks it, and whose `return()` marks it closed
-// (mirrors the real SDK Query handle `execute()` calls on the way out).
+// The queue is fed by the test; `query()` returns the Query object itself
+// (`iterable` below), which `execute()` calls `q.return()` on directly — NOT
+// only the iterator `[Symbol.asyncIterator]()` returns. A mock exposing
+// `return()` solely on the iterator lets `q.return()` throw (silently caught
+// by execute()'s own try/catch), so `isClosed()` never flips even though the
+// test looks green — hence `return()` is defined on `iterable` itself here,
+// same as the real SDK's `Query` (an AsyncGenerator, callable directly).
 function makeControllableStream() {
   const pending: FakeMessage[] = [];
   const waiters: Array<(msg: FakeMessage | typeof DONE) => void> = [];
@@ -24,6 +28,12 @@ function makeControllableStream() {
     const waiter = waiters.shift();
     if (waiter) waiter(message);
     else pending.push(message);
+  }
+
+  async function doReturn() {
+    closed = true;
+    for (const w of waiters.splice(0)) w(DONE);
+    return { done: true as const, value: undefined };
   }
 
   const iterable = {
@@ -38,13 +48,10 @@ function makeControllableStream() {
           if (message === DONE) return { done: true, value: undefined };
           return { done: false, value: message };
         },
-        async return() {
-          closed = true;
-          for (const w of waiters.splice(0)) w(DONE);
-          return { done: true, value: undefined };
-        },
+        return: doReturn,
       };
     },
+    return: doReturn,
   };
 
   return { push, iterable, isClosed: () => closed };
@@ -110,6 +117,42 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     // Both background_tasks_changed messages passed through as normal
     // content; the terminal result was released only once tasks drained.
     expect(seen.map((m) => m.type)).toEqual(["system", "system", "result"]);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("does not release the held terminal on an unrelated activity signal", async () => {
+    // Regression for a bug CodeRabbit caught on PR #459: onLifecycleSignal
+    // used to overwrite liveBackgroundTasks on EVERY signal, including
+    // `activity` (fired on the next assistant message, always backgroundTasks
+    // []) — wiping a real pending count and releasing the terminal early.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 0));
+    const stream = activeStream!;
+
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success" });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // An assistant message is what tapLifecycleStream treats as `activity` —
+    // must NOT clear the held task count.
+    stream.push({ type: "assistant", message: { content: [] } });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await drain;
+    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
 
   it("does not hold the terminal result when ceiling is 0", async () => {
@@ -133,6 +176,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
 
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
   });
 
   it("gives up and yields the terminal once the ceiling elapses", async () => {
@@ -158,5 +202,6 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     await drain; // resolves once the 20ms ceiling fires
     const results = seen.filter((m) => m.type === "result");
     expect(results).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
   });
 });
