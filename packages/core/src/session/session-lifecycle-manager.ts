@@ -15,8 +15,8 @@ import { calculateNextCronTrigger } from "../scheduler/cron.js";
 import { createLogger } from "../utils/logger.js";
 import { FleetStateWakePersistence } from "./fleet-state-wake-persistence.js";
 import { type ManagedSession, type ManageSessionOptions, SessionReaper } from "./session-reaper.js";
-import type { BackgroundTaskSummary, SessionWakeEntry } from "./types.js";
-import { WakeRegistry } from "./wake-registry.js";
+import type { BackgroundTaskSummary, SessionLifecycleSignal, SessionWakeEntry } from "./types.js";
+import { applyWakeSignal, WakeRegistry } from "./wake-registry.js";
 import type { NextRunResolver } from "./wake-store.js";
 
 type Logger = ReturnType<typeof createLogger>;
@@ -64,6 +64,30 @@ export type SessionWakeHandler = (
   session: RuntimeSession,
   entry: SessionWakeEntry,
 ) => void | Promise<void>;
+
+/**
+ * Per-job handle returned by {@link SessionLifecycleManager.trackJob}.
+ *
+ * Feeds a job's turn-boundary signals into wake capture (so a `ScheduleWakeup`/
+ * session cron registered mid-job survives the job's own completion instead of
+ * being silently dropped, vulpes-pack#148) and marks the job's session id
+ * "live" for its duration so a due wake for that same session can't cold-resume
+ * it out from under the running job. Unlike {@link ManagedSession}, this owns no
+ * `RuntimeSession` and never closes anything — `decideReap`'s
+ * keep-alive-while-background-tasks half is already handled inline by
+ * `SDKRuntime.execute()`'s own bg-wait (#458/#459); a job simply completes when
+ * its turn ends, and any wake it captured fires later as its own
+ * reaper-managed resumed session.
+ */
+export interface JobLifecycleTracker {
+  /**
+   * Pass to `RuntimeExecuteOptions.onLifecycleSignal`. Never throws/rejects —
+   * a wake-capture failure must not surface into the job's execution loop.
+   */
+  onLifecycleSignal: (signal: SessionLifecycleSignal) => Promise<void>;
+  /** Release the job's live-session mark. Idempotent; call from the job's `finally`. */
+  release: () => void;
+}
 
 export interface SessionLifecycleManagerOptions {
   /** State directory (`.herdctl`) backing the durable wake set. */
@@ -127,6 +151,13 @@ export class SessionLifecycleManager {
   private readonly logger: Logger;
   private sessionWakeHandler?: SessionWakeHandler;
   private resolveInjectedMcpServers?: ResolveInjectedMcpServers;
+  /**
+   * Session ids a `trackJob` job is currently running against, marked live for
+   * exactly the job's duration (see {@link JobLifecycleTracker}). Consulted by
+   * the registry's `isSessionLive` alongside the reaper's own live set so a due
+   * wake never cold-resumes a session a job already has open.
+   */
+  private readonly jobSessions = new Set<string>();
 
   constructor(options: SessionLifecycleManagerOptions) {
     this.openChatSession = options.openChatSession;
@@ -140,7 +171,7 @@ export class SessionLifecycleManager {
       persistence: new FleetStateWakePersistence({ stateDir: options.stateDir }),
       resolveNextRun: options.resolveNextRun ?? defaultResolveNextRun,
       fire: (entry) => this.fire(entry),
-      isSessionLive: (id) => this.reaper.isSessionLive(id),
+      isSessionLive: (id) => this.reaper.isSessionLive(id) || this.jobSessions.has(id),
       concurrency: options.concurrency,
       logger: this.logger,
     });
@@ -155,6 +186,44 @@ export class SessionLifecycleManager {
   /** Begin managing a freshly-opened streaming session's lifecycle. */
   manage(session: RuntimeSession, agent: string, options?: ManageSessionOptions): ManagedSession {
     return this.reaper.manage(session, agent, options);
+  }
+
+  /**
+   * Track a running job for wake capture: see {@link JobLifecycleTracker}.
+   *
+   * `resumeSessionId` marks the session live immediately for a job resuming an
+   * existing session; a fresh job (no resume target) learns and marks its
+   * session id off the first signal instead — every {@link
+   * SessionLifecycleSignal} carries a resolved `sessionId`, resumed or not.
+   */
+  trackJob(agent: string, resumeSessionId?: string): JobLifecycleTracker {
+    let trackedId = resumeSessionId;
+    if (trackedId) this.jobSessions.add(trackedId);
+    let released = false;
+
+    const onLifecycleSignal = async (signal: SessionLifecycleSignal): Promise<void> => {
+      if (!trackedId) {
+        trackedId = signal.sessionId;
+        this.jobSessions.add(trackedId);
+      }
+      try {
+        await applyWakeSignal(this.registry, agent, signal, this.logger);
+      } catch (error) {
+        // applyWakeSignal already logs+swallows internally; last-resort guard
+        // so nothing here can ever propagate into the job's execution loop.
+        this.logger.warn(
+          `trackJob onLifecycleSignal threw for ${agent} (${signal.sessionId}): ${(error as Error).message}`,
+        );
+      }
+    };
+
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      if (trackedId) this.jobSessions.delete(trackedId);
+    };
+
+    return { onLifecycleSignal, release };
   }
 
   /** Fire every wake now due. Wire as the scheduler's `onTick`. */
