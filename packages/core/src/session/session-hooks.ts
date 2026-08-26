@@ -114,11 +114,12 @@ export function buildLifecycleHooks(sink: LifecycleSignalSink): Options["hooks"]
     if (isMainAgentStop(input)) {
       // The CLI builds `background_tasks`/`session_crons` as one conditional
       // envelope and can omit BOTH fields for a given Stop, independent of the
-      // SDK's own per-field `?`-optionality. Detect via `in` — not `??` on the
-      // value — so "key absent" (no snapshot reported) isn't conflated with
-      // "key present, empty array" (authoritative: nothing pending). See
+      // SDK's own per-field `?`-optionality. Detect via `Array.isArray` — not
+      // `in` (true even for `{ background_tasks: undefined }`, reintroducing
+      // the old `?? []` clobber) and not `??` on the value — so "no snapshot
+      // reported" isn't conflated with "authoritative empty snapshot". See
       // {@link SessionLifecycleSignal.hasSnapshot}.
-      const fieldPresent = "background_tasks" in input;
+      const fieldPresent = Array.isArray(input.background_tasks);
       // `?? []` only normalizes nullish — it can't catch a non-array or
       // malformed SDK payload sneaking through as SessionCronSummary[]/
       // BackgroundTaskSummary[] (the reaper would then reconcile/decide off

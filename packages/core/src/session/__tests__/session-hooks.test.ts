@@ -118,7 +118,12 @@ describe("buildLifecycleHooks", () => {
     expect(signal.sessionCrons).toEqual([]);
   });
 
-  it("marks hasSnapshot true (via a present key) even when the value is explicitly undefined", async () => {
+  it("marks hasSnapshot false when the key is present but explicitly undefined", async () => {
+    // Array.isArray(undefined) is false, so a present-but-undefined key reads
+    // the same as an absent key — the stricter of the two readings. `in`
+    // would have called this "present" (true even for
+    // `{ background_tasks: undefined }`), reintroducing the old `?? []`
+    // clobber for this shape.
     const sink = vi.fn();
     const hooks = buildLifecycleHooks(sink);
     const cb = hooks!.Stop![0].hooks[0];
@@ -126,7 +131,9 @@ describe("buildLifecycleHooks", () => {
       signal: new AbortController().signal,
     });
     const signal = sink.mock.calls[0][0] as SessionLifecycleSignal;
-    expect(signal.hasSnapshot).toBe(true);
+    expect(signal.hasSnapshot).toBe(false);
+    expect(signal.sessionCrons).toEqual([]);
+    expect(signal.backgroundTasks).toEqual([]);
   });
 
   it("marks hasSnapshot true on a normal turn_end carrying a real snapshot", async () => {

@@ -268,7 +268,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
   });
 
   it("releases the held terminal on a turn_end Stop hook that authoritatively reports empty background_tasks", async () => {
-    // Gegenprobe: a genuine empty snapshot (the field present, just empty)
+    // Counter-check: a genuine empty snapshot (the field present, just empty)
     // must still release as before — only an omitted field is a non-snapshot.
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];

@@ -460,7 +460,7 @@ describe("SessionReaper", () => {
   });
 
   it("still reaps a genuinely idle session on a turn_end that authoritatively reports empty background_tasks", async () => {
-    // Gegenprobe: a real empty snapshot (field present, genuinely empty) must
+    // Counter-check: a real empty snapshot (field present, genuinely empty) must
     // still reap as before — only an omitted field is a non-snapshot.
     const registry = fakeRegistry();
     const onReap = vi.fn();
