@@ -95,11 +95,24 @@ function deletedCronId(input: PostToolUseHookInput): string | null {
 export function buildLifecycleHooks(sink: LifecycleSignalSink): Options["hooks"] {
   const stopCallback = async (input: HookInput) => {
     if (isMainAgentStop(input)) {
+      // The CLI builds `background_tasks`/`session_crons` as one conditional
+      // envelope and can omit BOTH fields for a given Stop, independent of the
+      // SDK's own per-field `?`-optionality. Detect via `in` — not `??` on the
+      // value — so "key absent" (no snapshot reported) isn't conflated with
+      // "key present, empty array" (authoritative: nothing pending). See
+      // {@link SessionLifecycleSignal.hasSnapshot}.
+      const hasSnapshot = "background_tasks" in input;
       const sessionCrons: SessionCronSummary[] = input.session_crons ?? [];
       const backgroundTasks: BackgroundTaskSummary[] = input.background_tasks ?? [];
       // Never let a sink failure reject the hook (which would disrupt turn flow);
       // log and continue. `emit` observes the async rejection off the hot path.
-      emit(sink, { kind: "turn_end", sessionId: input.session_id, sessionCrons, backgroundTasks });
+      emit(sink, {
+        kind: "turn_end",
+        sessionId: input.session_id,
+        sessionCrons,
+        backgroundTasks,
+        hasSnapshot,
+      });
     }
     return { continue: true };
   };

@@ -226,7 +226,16 @@ export class SDKRuntime implements RuntimeInterface {
       // here would let an `activity` signal (fired on the next assistant
       // message) wipe a real pending-task count to `[]` and release a held
       // terminal early.
-      if (signal.kind === "turn_end" || signal.kind === "background_tasks_changed") {
+      // `hasSnapshot === false` means a `turn_end` fired without the CLI's
+      // background_tasks envelope (see SessionLifecycleSignal.hasSnapshot) —
+      // `signal.backgroundTasks` is then just an empty stand-in, not "drained
+      // to empty". Keep whatever we already tracked instead of clobbering it,
+      // which previously released a held terminal (and its live background
+      // subagent got killed) mid-wait. See edspencer/herdctl#459 follow-up.
+      if (
+        (signal.kind === "turn_end" || signal.kind === "background_tasks_changed") &&
+        signal.hasSnapshot !== false
+      ) {
         liveBackgroundTasks = signal.backgroundTasks;
       }
     };

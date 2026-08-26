@@ -93,6 +93,51 @@ describe("buildLifecycleHooks", () => {
     expect(signal.backgroundTasks).toEqual([]);
   });
 
+  it("marks hasSnapshot false when the CLI omits the background_tasks envelope entirely", async () => {
+    // The CLI's Stop-hook payload builder wraps background_tasks/
+    // session_crons in one conditional envelope and can omit the key
+    // outright — distinct from the field being present with value
+    // `undefined` (the previous test). See #459 follow-up.
+    const sink = vi.fn();
+    const hooks = buildLifecycleHooks(sink);
+    const cb = hooks!.Stop![0].hooks[0];
+    const inputWithoutEnvelope = {
+      hook_event_name: "Stop",
+      session_id: "sess-1",
+      transcript_path: "/tmp/t.jsonl",
+      cwd: "/tmp",
+      stop_hook_active: false,
+      // no background_tasks / session_crons keys at all
+    } as unknown as HookInput;
+
+    await cb(inputWithoutEnvelope, undefined, { signal: new AbortController().signal });
+
+    const signal = sink.mock.calls[0][0] as SessionLifecycleSignal;
+    expect(signal.hasSnapshot).toBe(false);
+    expect(signal.backgroundTasks).toEqual([]);
+    expect(signal.sessionCrons).toEqual([]);
+  });
+
+  it("marks hasSnapshot true (via a present key) even when the value is explicitly undefined", async () => {
+    const sink = vi.fn();
+    const hooks = buildLifecycleHooks(sink);
+    const cb = hooks!.Stop![0].hooks[0];
+    await cb(stopInput({ session_crons: undefined, background_tasks: undefined }), undefined, {
+      signal: new AbortController().signal,
+    });
+    const signal = sink.mock.calls[0][0] as SessionLifecycleSignal;
+    expect(signal.hasSnapshot).toBe(true);
+  });
+
+  it("marks hasSnapshot true on a normal turn_end carrying a real snapshot", async () => {
+    const sink = vi.fn();
+    const hooks = buildLifecycleHooks(sink);
+    const cb = hooks!.Stop![0].hooks[0];
+    await cb(stopInput(), undefined, { signal: new AbortController().signal });
+    const signal = sink.mock.calls[0][0] as SessionLifecycleSignal;
+    expect(signal.hasSnapshot).toBe(true);
+  });
+
   it("does nothing for non-stop hook inputs", async () => {
     const sink = vi.fn();
     const hooks = buildLifecycleHooks(sink);

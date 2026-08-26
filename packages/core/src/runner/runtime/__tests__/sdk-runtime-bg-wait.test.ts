@@ -69,9 +69,20 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   tool: vi.fn(() => ({})),
 }));
 
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ResolvedAgent } from "../../../config/index.js";
 import type { RuntimeExecuteOptions } from "../interface.js";
 import { SDKRuntime } from "../sdk-runtime.js";
+
+/** Grab the Stop-hook callback `execute()` registered on its last `query()` call. */
+function stopCallbackFromLastQueryCall(): (input: unknown) => Promise<unknown> {
+  const lastCall = vi.mocked(query).mock.calls.at(-1)!;
+  const options = (lastCall[0] as { options: Record<string, unknown> }).options;
+  const hooks = options.hooks as {
+    Stop: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }>;
+  };
+  return hooks.Stop[0].hooks[0];
+}
 
 const agent = { name: "keeper", qualifiedName: "keeper" } as unknown as ResolvedAgent;
 
@@ -203,5 +214,97 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     const results = seen.filter((m) => m.type === "result");
     expect(results).toHaveLength(1);
     expect(stream.isClosed()).toBe(true);
+  });
+
+  it("does not release the held terminal on a turn_end Stop hook fired without a background_tasks snapshot", async () => {
+    // Regression for the prod #459 follow-up (job-2026-08-26-6opnmq): the
+    // CLI's Stop-hook payload builder is conditional and can omit
+    // `background_tasks`/`session_crons` entirely for a turn, independent of
+    // the SDK's own per-field `?`-optionality. `input.background_tasks ?? []`
+    // used to read that omission as an authoritative "nothing pending",
+    // clobbering the live count tracked from `background_tasks_changed` and
+    // releasing the held terminal — killing the still-running background
+    // subagent.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 0));
+    const stream = activeStream!;
+
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // Simulate the CLI firing Stop without the background_tasks/session_crons
+    // envelope at all (not even `background_tasks: undefined`).
+    const stopCallback = stopCallbackFromLastQueryCall();
+    await stopCallback({
+      hook_event_name: "Stop",
+      session_id: "sess-1",
+      transcript_path: "/tmp/t.jsonl",
+      cwd: "/tmp",
+      stop_hook_active: false,
+    });
+    // Force the execute() loop to re-check its release condition (it only
+    // re-evaluates on the next stream message, not on the out-of-band hook
+    // call itself) with a message that carries no task snapshot of its own.
+    stream.push({ type: "assistant", message: { content: [] } });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await drain;
+    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+  });
+
+  it("releases the held terminal on a turn_end Stop hook that authoritatively reports empty background_tasks", async () => {
+    // Gegenprobe: a genuine empty snapshot (the field present, just empty)
+    // must still release as before — only an omitted field is a non-snapshot.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 0));
+    const stream = activeStream!;
+
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    const stopCallback = stopCallbackFromLastQueryCall();
+    await stopCallback({
+      hook_event_name: "Stop",
+      session_id: "sess-1",
+      transcript_path: "/tmp/t.jsonl",
+      cwd: "/tmp",
+      stop_hook_active: false,
+      background_tasks: [],
+      session_crons: [],
+    });
+    // Force the execute() loop to re-check its release condition — see the
+    // no-snapshot test above for why this is needed.
+    stream.push({ type: "assistant", message: { content: [] } });
+
+    await drain;
+    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
 });
