@@ -219,7 +219,7 @@ export class SDKRuntime implements RuntimeInterface {
     // `onLifecycleSignal` below (fine to be async there — nothing in this
     // loop is waiting on that same tick).
     let liveBackgroundTasks: BackgroundTaskSummary[] = [];
-    const onLifecycleSignal = (signal: SessionLifecycleSignal) => {
+    const trackBackgroundTasks = (signal: SessionLifecycleSignal) => {
       // `activity` and `cron_deleted` carry no task snapshot (always `[]`,
       // see SessionLifecycleSignal's own doc) — only `turn_end` and
       // `background_tasks_changed` are authoritative. Taking every signal
@@ -237,6 +237,25 @@ export class SDKRuntime implements RuntimeInterface {
         signal.hasSnapshot !== false
       ) {
         liveBackgroundTasks = signal.backgroundTasks;
+      }
+    };
+    // Compose: this internal bg-wait tracker runs first and synchronously (the
+    // anchor decision above depends on it), then the caller's own
+    // `onLifecycleSignal` consumer (e.g. `SessionLifecycleManager.trackJob`,
+    // vulpes-pack#148) rides along on the same signals. A throwing/rejecting
+    // consumer must never break this message loop or release a held terminal
+    // early, so both failure shapes are swallowed here.
+    const onLifecycleSignal = (signal: SessionLifecycleSignal) => {
+      trackBackgroundTasks(signal);
+      try {
+        const consumerResult = options.onLifecycleSignal?.(signal);
+        if (consumerResult && typeof consumerResult.catch === "function") {
+          void consumerResult.catch(() => {
+            // Swallow — a consumer sink must not break the message loop.
+          });
+        }
+      } catch {
+        // Swallow — a consumer sink must not break the message loop.
       }
     };
     sdkOptions.hooks = {
