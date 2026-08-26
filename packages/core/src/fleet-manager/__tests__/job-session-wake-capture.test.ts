@@ -65,6 +65,25 @@ function dueWake(overrides: Partial<SessionWakeEntry> = {}): SessionWakeEntry {
   };
 }
 
+/**
+ * Fires `onLifecycleSignal` the way production actually does — fire-and-forget
+ * on a deferred microtask (`SDKRuntime.execute()` never awaits the consumer,
+ * and `session-hooks.ts`'s `emit()` defers via `Promise.resolve().then()`) —
+ * rather than the earlier stub shape of `await options.onLifecycleSignal?.()`,
+ * which pinned an ordering guarantee the real runtime doesn't provide. Tests
+ * that need the signal to have landed call `flushMicrotasks()` afterward.
+ */
+function emitLifecycleSignal(
+  options: RuntimeExecuteOptions,
+  signal: Parameters<NonNullable<RuntimeExecuteOptions["onLifecycleSignal"]>>[0],
+): void {
+  void Promise.resolve().then(() => options.onLifecycleSignal?.(signal));
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
 describe("job-path session wake capture (vulpes-pack#148)", () => {
   let tempDir: string;
   let configDir: string;
@@ -118,7 +137,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
     vi.spyOn(RuntimeFactory, "create").mockReturnValue(
       stubRuntime(async function* (options) {
         yield { type: "system", subtype: "init", session_id: "sess-job-1" };
-        await options.onLifecycleSignal?.({
+        emitLifecycleSignal(options, {
           kind: "turn_end",
           sessionId: "sess-job-1",
           sessionCrons: [{ id: "c1", schedule: "* * * * *", recurring: false, prompt: "WAKE" }],
@@ -137,6 +156,9 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
     const job = await getJob(jobsDir, result.jobId);
     expect(job?.status).toBe("completed");
 
+    // The signal was deferred (fire-and-forget, as production delivers it) —
+    // give its microtask a turn to land before reading the persisted wake.
+    await flushMicrotasks();
     const persisted = await new FleetStateWakePersistence({ stateDir }).load();
     expect(persisted).toHaveLength(1);
     expect(persisted[0]).toMatchObject({ id: "c1", agent: "keeper", sessionId: "sess-job-1" });
@@ -206,7 +228,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
         yield { type: "system", subtype: "init", session_id: "sess-bare-1" };
         // A signal still arrives (SDKRuntime always calls it); with no
         // lifecycle manager there is simply no tracker to feed.
-        await options.onLifecycleSignal?.({
+        emitLifecycleSignal(options, {
           kind: "turn_end",
           sessionId: "sess-bare-1",
           sessionCrons: [{ id: "c-bare", schedule: "* * * * *", recurring: false, prompt: "WAKE" }],
@@ -218,6 +240,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
 
     const result = await manager.trigger("bare");
     expect(result.success).toBe(true);
+    await flushMicrotasks();
     expect(await new FleetStateWakePersistence({ stateDir }).load()).toEqual([]);
   });
 
@@ -233,7 +256,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
     vi.spyOn(RuntimeFactory, "create").mockReturnValue(
       stubRuntime(async function* (options) {
         yield { type: "system", subtype: "init", session_id: "sess-sched-1" };
-        await options.onLifecycleSignal?.({
+        emitLifecycleSignal(options, {
           kind: "turn_end",
           sessionId: "sess-sched-1",
           sessionCrons: [
@@ -261,6 +284,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
     };
     await executor.executeSchedule(info);
 
+    await flushMicrotasks();
     const persisted = await new FleetStateWakePersistence({ stateDir }).load();
     expect(persisted).toHaveLength(1);
     expect(persisted[0]).toMatchObject({
@@ -282,7 +306,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
     vi.spyOn(RuntimeFactory, "create").mockReturnValue(
       stubRuntime(async function* (options) {
         yield { type: "system", subtype: "init", session_id: "sess-restart-1" };
-        await options.onLifecycleSignal?.({
+        emitLifecycleSignal(options, {
           kind: "turn_end",
           sessionId: "sess-restart-1",
           sessionCrons: [
@@ -294,6 +318,7 @@ describe("job-path session wake capture (vulpes-pack#148)", () => {
       }),
     );
     await manager.trigger("keeper2");
+    await flushMicrotasks();
 
     // Force the persisted wake overdue, then simulate a daemon restart: a
     // brand-new FleetManager instance over the identical stateDir.

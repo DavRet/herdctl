@@ -436,6 +436,60 @@ describe("SessionLifecycleManager.trackJob (vulpes-pack#148)", () => {
     expect((await slm2.dispatchDue(NOW)).map((e) => e.id)).toEqual(["w-after-release"]);
   });
 
+  it("keeps a session live until every concurrent job tracking it has released (refcount)", async () => {
+    await new FleetStateWakePersistence({ stateDir }).save([
+      dueWake({ id: "w-refcount", sessionId: "sess-shared" }),
+    ]);
+    const openChatSession = vi.fn().mockResolvedValue(fakeSession());
+    const slm = new SessionLifecycleManager({ stateDir, openChatSession, resolveNextRun });
+
+    // Two jobs concurrently resume the same session id (e.g. `dispatchDue`
+    // firing a wake for it while a second job is already mid-flight against
+    // it — see edspencer/herdctl#460).
+    const trackerA = slm.trackJob("team/agent", "sess-shared");
+    const trackerB = slm.trackJob("team/agent", "sess-shared");
+
+    trackerA.release();
+    // A `Set`-based live mark would have unpinned the session right here —
+    // trackerB is still running against it.
+    expect(await slm.dispatchDue(NOW)).toEqual([]);
+    expect(openChatSession).not.toHaveBeenCalled();
+
+    trackerB.release();
+    const dispatched = await slm.dispatchDue(NOW);
+    expect(dispatched.map((e) => e.id)).toEqual(["w-refcount"]);
+  });
+
+  it("a lifecycle signal that arrives after release() does not re-pin the session live or persist a wake", async () => {
+    const slm = new SessionLifecycleManager({
+      stateDir,
+      openChatSession: vi.fn().mockResolvedValue(fakeSession()),
+      resolveNextRun,
+    });
+    const tracker = slm.trackJob("team/agent"); // fresh job, learns its id off the first signal
+    tracker.release(); // the job's own turn already completed before any signal arrived
+
+    // A straggler signal (e.g. a deferred `emit()` microtask from a Stop hook
+    // firing right as the job finished) must be a full no-op: it must neither
+    // persist the wake it carries nor re-pin the session live — otherwise
+    // nothing left holding this tracker will ever release it, and every
+    // future dispatch for that session id silently stops firing.
+    await tracker.onLifecycleSignal(
+      turnEndSignal({
+        sessionId: "sess-straggler",
+        sessionCrons: [{ id: "c-straggler", schedule: "+60s", recurring: false, prompt: "WAKE" }],
+      }),
+    );
+    expect(await new FleetStateWakePersistence({ stateDir }).load()).toEqual([]);
+
+    // A wake for that same session id, seeded independently, must still fire
+    // normally — the straggler must not have pinned it live.
+    await new FleetStateWakePersistence({ stateDir }).save([
+      dueWake({ id: "w-straggler", sessionId: "sess-straggler" }),
+    ]);
+    expect((await slm.dispatchDue(NOW)).map((e) => e.id)).toEqual(["w-straggler"]);
+  });
+
   it("a rejecting registry.reconcile never propagates out of onLifecycleSignal", async () => {
     const slm = new SessionLifecycleManager({
       stateDir,

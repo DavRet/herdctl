@@ -152,12 +152,34 @@ export class SessionLifecycleManager {
   private sessionWakeHandler?: SessionWakeHandler;
   private resolveInjectedMcpServers?: ResolveInjectedMcpServers;
   /**
-   * Session ids a `trackJob` job is currently running against, marked live for
-   * exactly the job's duration (see {@link JobLifecycleTracker}). Consulted by
-   * the registry's `isSessionLive` alongside the reaper's own live set so a due
-   * wake never cold-resumes a session a job already has open.
+   * Refcount of `trackJob` jobs currently running against each session id,
+   * marked live for exactly the job's duration (see {@link
+   * JobLifecycleTracker}). Consulted by the registry's `isSessionLive`
+   * alongside the reaper's own live set so a due wake never cold-resumes a
+   * session a job already has open.
+   *
+   * A `Map<string, number>` refcount rather than a `Set<string>`: two jobs can
+   * legitimately run against the same session id concurrently (e.g. a resumed
+   * job overlapping a fresh job that hasn't learned its session id yet), and a
+   * `Set`'s unconditional delete-on-release let the first job to finish clear
+   * the live mark out from under the second, still-running one — `dispatchDue`
+   * would then see the session as not-live and `openSession` would cold-resume
+   * it while the second job still held it open.
    */
-  private readonly jobSessions = new Set<string>();
+  private readonly jobSessions = new Map<string, number>();
+
+  /** Increment a session id's job refcount. */
+  private retainJobSession(id: string): void {
+    this.jobSessions.set(id, (this.jobSessions.get(id) ?? 0) + 1);
+  }
+
+  /** Decrement a session id's job refcount, clearing the entry at zero. */
+  private releaseJobSession(id: string): void {
+    const count = this.jobSessions.get(id);
+    if (count === undefined) return;
+    if (count <= 1) this.jobSessions.delete(id);
+    else this.jobSessions.set(id, count - 1);
+  }
 
   constructor(options: SessionLifecycleManagerOptions) {
     this.openChatSession = options.openChatSession;
@@ -198,13 +220,18 @@ export class SessionLifecycleManager {
    */
   trackJob(agent: string, resumeSessionId?: string): JobLifecycleTracker {
     let trackedId = resumeSessionId;
-    if (trackedId) this.jobSessions.add(trackedId);
+    if (trackedId) this.retainJobSession(trackedId);
     let released = false;
 
     const onLifecycleSignal = async (signal: SessionLifecycleSignal): Promise<void> => {
+      // A signal that arrives after `release()` (a straggler from a job whose
+      // own turn already completed) must not re-pin the session live —
+      // otherwise it silently blocks every future wake for that session id
+      // forever, since nothing left in this tracker will ever release it.
+      if (released) return;
       if (!trackedId) {
         trackedId = signal.sessionId;
-        this.jobSessions.add(trackedId);
+        this.retainJobSession(trackedId);
       }
       try {
         await applyWakeSignal(this.registry, agent, signal, this.logger);
@@ -220,7 +247,7 @@ export class SessionLifecycleManager {
     const release = (): void => {
       if (released) return;
       released = true;
-      if (trackedId) this.jobSessions.delete(trackedId);
+      if (trackedId) this.releaseJobSession(trackedId);
     };
 
     return { onLifecycleSignal, release };
