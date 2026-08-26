@@ -30,7 +30,7 @@ function makeControllableStream() {
     else pending.push(message);
   }
 
-  async function doReturn() {
+  async function doReturn(): Promise<{ done: true; value: undefined }> {
     closed = true;
     for (const w of waiters.splice(0)) w(DONE);
     return { done: true as const, value: undefined };

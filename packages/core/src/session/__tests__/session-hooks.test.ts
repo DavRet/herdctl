@@ -138,6 +138,34 @@ describe("buildLifecycleHooks", () => {
     expect(signal.hasSnapshot).toBe(true);
   });
 
+  it("marks hasSnapshot false and ignores the snapshot when background_tasks is present but malformed", async () => {
+    // `?? []` only normalizes nullish — a non-array/invalid SDK payload must
+    // not sneak through as SessionCronSummary[]/BackgroundTaskSummary[].
+    // Field present + invalid shape is treated like field absent: logged and
+    // dropped, not crashed on.
+    const sink = vi.fn();
+    const hooks = buildLifecycleHooks(sink);
+    const cb = hooks!.Stop![0].hooks[0];
+    const malformedInput = {
+      hook_event_name: "Stop",
+      session_id: "sess-1",
+      transcript_path: "/tmp/t.jsonl",
+      cwd: "/tmp",
+      stop_hook_active: false,
+      background_tasks: "not-an-array",
+      session_crons: [{ id: "c1", schedule: "35 13 * * *", recurring: false, prompt: "go" }],
+    } as unknown as HookInput;
+
+    await expect(
+      cb(malformedInput, undefined, { signal: new AbortController().signal }),
+    ).resolves.toEqual({ continue: true });
+
+    const signal = sink.mock.calls[0][0] as SessionLifecycleSignal;
+    expect(signal.hasSnapshot).toBe(false);
+    expect(signal.backgroundTasks).toEqual([]);
+    expect(signal.sessionCrons).toEqual([]);
+  });
+
   it("does nothing for non-stop hook inputs", async () => {
     const sink = vi.fn();
     const hooks = buildLifecycleHooks(sink);
