@@ -123,10 +123,16 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    // The drain message alone is non-terminal and no longer ends the wait
+    // (see the "keeps waiting past a non-terminal drain message" test below)
+    // — the background task's own re-invocation turn still needs to produce
+    // its real terminal, here simulated as arriving right after the drain.
+    stream.push({ type: "result", subtype: "success" });
     await drain;
 
     // Both background_tasks_changed messages passed through as normal
-    // content; the terminal result was released only once tasks drained.
+    // content; the terminal result was released only once a fresh terminal
+    // arrived after tasks drained.
     expect(seen.map((m) => m.type)).toEqual(["system", "system", "result"]);
     expect(stream.isClosed()).toBe(true);
   });
@@ -162,6 +168,9 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    // Drain alone is non-terminal — the loop still waits for a fresh
+    // terminal (the re-invocation's own result) before releasing.
+    stream.push({ type: "result", subtype: "success" });
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
@@ -255,14 +264,15 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       cwd: "/tmp",
       stop_hook_active: false,
     });
-    // Force the execute() loop to re-check its release condition (it only
-    // re-evaluates on the next stream message, not on the out-of-band hook
-    // call itself) with a message that carries no task snapshot of its own.
+    // A message that carries no task snapshot of its own must not clobber
+    // the tracked live count either.
     stream.push({ type: "assistant", message: { content: [] } });
     await new Promise((r) => setTimeout(r, 10));
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    // Drain alone is non-terminal — wait for the re-invocation's own result.
+    stream.push({ type: "result", subtype: "success" });
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
@@ -300,11 +310,55 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       background_tasks: [],
       session_crons: [],
     });
-    // Force the execute() loop to re-check its release condition — see the
-    // no-snapshot test above for why this is needed.
     stream.push({ type: "assistant", message: { content: [] } });
+    // The Stop hook's authoritative empty snapshot is non-terminal — wait
+    // for the re-invocation's own result before releasing.
+    stream.push({ type: "result", subtype: "success" });
 
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+  });
+
+  it("keeps waiting past a non-terminal drain message and yields the fresh terminal, not the stale held one", async () => {
+    // Regression: the release check used to run after every message once a
+    // terminal was pending, not only on a fresh terminal. A
+    // `background_tasks_changed` drain message (tasks: []) is non-terminal —
+    // it gets yielded and passes straight through — but it also flips
+    // liveBackgroundTasks to empty in the same tick. The old code then broke
+    // right there, before the background task's own re-invocation turn
+    // (further assistant content + its real terminal) ever streamed, so the
+    // consumer only ever saw the stale first result.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await new Promise((r) => setTimeout(r, 0));
+    const stream = activeStream!;
+
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", stale: true });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // Drain event: non-terminal, but reports the task list as empty.
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await new Promise((r) => setTimeout(r, 10));
+    // The background subagent's own re-invocation turn, arriving late.
+    stream.push({ type: "assistant", message: { content: [] } });
+    stream.push({ type: "result", subtype: "success", stale: false });
+
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ stale: false });
   });
 });

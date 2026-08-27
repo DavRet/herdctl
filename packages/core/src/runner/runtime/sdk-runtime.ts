@@ -308,18 +308,22 @@ export class SDKRuntime implements RuntimeInterface {
           // Supersedes any terminal already held — e.g. a re-invocation turn
           // (the background task's own completion) produces a newer one.
           pendingTerminal = message;
+          // Only a *fresh* terminal message may end the wait. Checking this
+          // outside the branch (on every message once a terminal was pending)
+          // let a non-terminal `background_tasks_changed` drain event — which
+          // reaches this loop synchronously above and can flip
+          // liveBackgroundTasks to `[]` in the same iteration — break the
+          // loop right after the drain, before the background task's own
+          // re-invocation turn (further assistant messages + its real
+          // terminal) ever streamed. The consumer then saw the stale first
+          // terminal as the final answer.
+          if (liveBackgroundTasks.length === 0 || ceilingMs === 0) break;
+          // else: keep looping, still holding.
         } else {
           // Always forwarded, including while a terminal is held: a
           // re-invocation's own content (assistant/tool messages) must reach
           // the consumer, not just its eventual terminal.
           yield message;
-        }
-
-        if (pendingTerminal) {
-          // ceilingMs === 0 mirrors `-p`'s "0 = don't wait" — stop holding
-          // immediately rather than arming a zero-length timer.
-          if (liveBackgroundTasks.length === 0 || ceilingMs === 0) break;
-          // else: keep looping, still holding.
         }
       }
 
