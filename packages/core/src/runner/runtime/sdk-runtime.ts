@@ -291,7 +291,14 @@ export class SDKRuntime implements RuntimeInterface {
     // review MAJOR C): the overwhelming majority of runs never touch a
     // background task at all, and RACE_SETTLE_MS shouldn't tax every one of
     // them with a tail on their clean terminal just to hedge against a race
-    // that, by definition, can't happen for a run with no background activity.
+    // that, by definition, can't happen for a run with no background activity
+    // SO FAR. Combined below with `firstTerminalSeen`: the exact shape of the
+    // original prod incident this whole effort started from — a fresh run's
+    // very FIRST-ever background dispatch racing its own (first) terminal —
+    // has no `sawBackgroundActivity` history to lean on by definition, so it
+    // cannot be the one case MAJOR C's optimization excludes. Second-and-later
+    // terminals in a run that has genuinely never touched background work are
+    // the only ones that skip the settle window.
     let sawBackgroundActivity = false;
     const noteBackgroundTasks = (tasks: BackgroundTaskSummary[]) => {
       sawBackgroundActivity = true;
@@ -366,6 +373,13 @@ export class SDKRuntime implements RuntimeInterface {
     const iterator = messages[Symbol.asyncIterator]();
 
     let pendingTerminal: SDKMessage | undefined;
+    // True once this run has processed its first terminal message — verify
+    // round 3 (#206): a fresh run's very first background dispatch racing
+    // its own (first) terminal has no `sawBackgroundActivity` history to
+    // gate on, so the settle window arms for a run's first terminal
+    // regardless. Only a SECOND-and-later terminal in a run that has never
+    // touched background work skips it.
+    let firstTerminalSeen = false;
     // Armed either on a drain-to-empty (the long reinvocation grace) or on a
     // fresh terminal with zero known live tasks (the short ordering-race
     // settle) — see REINVOCATION_GRACE_ELAPSED above. Re-armed fresh each
@@ -500,9 +514,14 @@ export class SDKRuntime implements RuntimeInterface {
         }
 
         const isFreshTerminal = isTerminalMessage(message);
+        // Computed BEFORE `firstTerminalSeen` is updated below, so it reads
+        // "was this the first terminal we've EVER seen" — a SECOND terminal
+        // arriving later correctly reads false.
+        const isFirstTerminal = isFreshTerminal && !firstTerminalSeen;
         if (isFreshTerminal) {
           // Supersedes any terminal already held — e.g. a re-invocation turn
           // (the background task's own completion) produces a newer one.
+          firstTerminalSeen = true;
           pendingTerminal = message;
         } else {
           // Always forwarded, including while a terminal is held: a
@@ -514,7 +533,7 @@ export class SDKRuntime implements RuntimeInterface {
         if (pendingTerminal) {
           if (liveBackgroundTasks.length > 0) {
             // Still (or newly) live — nothing to arm; already cleared above.
-          } else if (isFreshTerminal && sawBackgroundActivity) {
+          } else if (isFreshTerminal && (sawBackgroundActivity || isFirstTerminal)) {
             // Ordering race: a background task dispatched IN this terminal
             // turn can lose the wire race against the turn's own terminal
             // (SDK ordering unspecified, vulpes-pack#206 follow-up). Settle
@@ -522,13 +541,20 @@ export class SDKRuntime implements RuntimeInterface {
             // — if the task's announcement lands within the window,
             // `liveBackgroundTasks` flips non-empty and the next iteration
             // holds normally instead of releasing over a fresh orphan.
-            // Gated on `sawBackgroundActivity` (MAJOR C): a run that has
-            // never touched a background task at all has no race to settle
-            // for, and shouldn't pay this tail on every clean terminal.
+            //
+            // Two reasons to arm here (verify round 3): `sawBackgroundActivity`
+            // (MAJOR C — a run that has touched background work before has a
+            // real race to settle for), OR `isFirstTerminal` — a run's very
+            // FIRST-ever terminal always gets the settle regardless, because a
+            // virgin first background dispatch racing that exact terminal has
+            // no prior activity to gate on and IS the shape of the original
+            // prod incident (job-w11ho7) this whole effort started from. Only
+            // a SECOND-and-later terminal in a run that has genuinely never
+            // touched background work skips the tail.
             armGrace(raceSettleMs());
           } else if (isFreshTerminal) {
-            // Never had background work: nothing to wait for — the v2
-            // immediate release, no tail at all.
+            // Second-and-later terminal, never touched background work:
+            // nothing to wait for — the v2 immediate release, no tail.
             clearGrace();
             clearMaxHold();
             break;

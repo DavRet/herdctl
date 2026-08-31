@@ -139,11 +139,13 @@ describe("SDKRuntime.execute() background-task hold (issue #458, no ceiling — 
     const stream = activeStream!;
     stream.push({ type: "result", subtype: "success" });
 
-    // No settle window at all (MAJOR C, verify round 2): this run never
-    // touched background work, so there's no race to settle for — releases
-    // on pure microtask flushing, no timer advance needed. See the dedicated
-    // "no timer armed at all" test below for a stronger assertion of this.
-    await flushMicrotasks();
+    // Still goes through the settle window (verify round 3): a run's FIRST
+    // terminal always gets one, regardless of background activity — a virgin
+    // first background dispatch racing that exact terminal has no prior
+    // activity to gate on. Nothing shows up here, so this is
+    // effectively-immediate. See the dedicated "second-and-later terminal,
+    // no added tail" test below for the case that actually skips it.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
     expect(stream.isClosed()).toBe(true);
@@ -740,20 +742,19 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
     expect(stream.isClosed()).toBe(true);
   });
 
-  it("MAJOR 3: a background task announced right after its own terminal is not orphaned (run has touched background work before)", async () => {
+  it("MAJOR 3: a SECOND background task announced right after its own terminal is not orphaned (run has touched background work before)", async () => {
     // The SDK's ordering between a terminal turn's own result and a
     // background task IT dispatched is unspecified — the task's
     // `background_tasks_changed` announcement can arrive just AFTER the
     // terminal that spawned it, not before. `liveBackgroundTasks` reads
     // stale-empty at the exact moment the terminal is processed.
     //
-    // #206 review MAJOR C narrowed the settle window to runs that have
-    // ALREADY reported background activity at least once (`sawBackgroundActivity`)
-    // — a run's very first-ever background dispatch racing its own terminal
-    // is a known, accepted gap of that trade-off (see the test below), not
-    // covered here. This pins the scope MAJOR C actually leaves intact: a
-    // SECOND task dispatched by a re-invocation turn, racing that turn's own
-    // terminal, in a run that already touched background work earlier.
+    // Pins the `sawBackgroundActivity` disjunct of the settle-arming
+    // condition specifically: a SECOND task dispatched by a re-invocation
+    // turn, racing that turn's own terminal, in a run that already touched
+    // background work earlier. See the test below for the `isFirstTerminal`
+    // disjunct (a run's very first-ever terminal, restored in verify round 3
+    // after MAJOR C briefly narrowed it away).
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -813,15 +814,14 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
     expect(stream.isClosed()).toBe(true);
   });
 
-  it("MAJOR C trade-off: a run's very first background dispatch racing its own (first) terminal is not caught — documented gap, not a regression to fix here", async () => {
-    // Without any PRIOR background_tasks_changed, sawBackgroundActivity is
-    // false, so the settle window never arms for this exact terminal — the
-    // v2 immediate-release fast path runs instead, same as a run with no
-    // background work at all. This is the accepted cost of MAJOR C (an
-    // unconditional settle tail on every clean terminal, including the
-    // overwhelming majority of runs that never touch background work, was
-    // itself a review finding) — flagged here so it's a conscious, visible
-    // trade-off rather than a silent regression of the MAJOR 3 fix above.
+  it("MAJOR 3 (restored, verify round 3): a run's very FIRST background dispatch racing its own (first) terminal is not orphaned", async () => {
+    // The exact shape of the original prod incident (job-w11ho7) this whole
+    // effort started from: a fresh run's first-ever terminal, with a
+    // background task it just dispatched still in flight to announce
+    // itself. MAJOR C (verify round 2) briefly narrowed the settle window to
+    // runs with PRIOR background activity, which silently reopened this
+    // exact case — closed again in verify round 3 via `isFirstTerminal`: a
+    // run's first terminal always gets the settle, regardless of history.
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -833,11 +833,36 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
     await flushMicrotasks();
     const stream = activeStream!;
 
+    // Terminal arrives FIRST — no task has ever been reported live yet.
     stream.push({ type: "result", subtype: "success", result: "spawned a child" } as FakeMessage);
-    await drain; // released immediately — no settle window on a first-ever terminal
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false); // settle window armed, not released yet
+
+    // The task's announcement lands moments later, within the settle window.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS / 2);
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "late-t1" }],
+    });
+    await flushMicrotasks();
+
+    // Must NOT have released over the fresh orphan — now holding on the
+    // (newly known live) task exactly like any other live-task case.
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // The child eventually finishes.
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
 
     const results = seen.filter((m) => m.type === "result");
     expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("spawned a child");
     expect(stream.isClosed()).toBe(true);
   });
 });
@@ -898,11 +923,14 @@ describe("SDKRuntime.execute() verify round 2 (4 majors + 2 minors)", () => {
     expect(stream.isClosed()).toBe(true);
   });
 
-  it("MAJOR C: a job that never touches background work releases with no added tail — no timer armed at all", async () => {
-    // Stronger than "fast": if ANY timer (settle, reinvocation, or maxHold)
-    // were armed here, `drain` would never resolve without an explicit
-    // `vi.advanceTimersByTimeAsync` call, since fake timers never
-    // auto-advance — this test deliberately makes none.
+  it("MAJOR C (verify round 3 scope): a SECOND-and-later terminal in a run that never touches background work has no added tail", async () => {
+    // A run's FIRST terminal always gets the settle window (verify round 3
+    // restored that for the ordering-race case above) — MAJOR C's win is
+    // narrower than "no tail ever": only a second-and-later terminal in a
+    // run that has genuinely never touched background work skips it. If ANY
+    // timer got armed for the SECOND terminal here, `drain` would never
+    // resolve without a further `vi.advanceTimersByTimeAsync` call after it
+    // — this test deliberately makes none.
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -913,12 +941,21 @@ describe("SDKRuntime.execute() verify round 2 (4 majors + 2 minors)", () => {
 
     await flushMicrotasks();
     const stream = activeStream!;
-    stream.push({ type: "result", subtype: "success", result: "no bg work" } as FakeMessage);
 
-    await drain; // no timer advance at all — hangs (and times out) if anything got armed
+    // First terminal — arms its own settle window (first-terminal exception).
+    stream.push({ type: "result", subtype: "success", result: "first" } as FakeMessage);
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false); // settle armed, not released yet
+
+    // A second terminal supersedes it WITHIN that window. This run has never
+    // touched background work, and this is no longer the first terminal —
+    // no settle window of its own: immediate release, no added tail.
+    stream.push({ type: "result", subtype: "success", result: "second" } as FakeMessage);
+    await drain; // no additional timer advance — hangs here if a tail got added
 
     const results = seen.filter((m) => m.type === "result");
     expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("second");
     expect(stream.isClosed()).toBe(true);
   });
 
