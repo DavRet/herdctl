@@ -18,6 +18,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  */
 const injectedTurns: string[] = [];
 
+/**
+ * `SDKRuntime.execute()` (herdctl#458) now feeds `query()` a queue-backed
+ * streaming-input iterable for EVERY run, not just `openSession()`-backed
+ * ones — the old `typeof input === "string"` branch below is unreachable
+ * post-#458, so it no longer distinguishes the "nobody will ever inject a
+ * second turn" case. The non-interactive test opts into this instead: it has
+ * no handle to inject through, so the mock must resolve turn 1 on its own
+ * rather than blocking for a turn 2 that will never arrive.
+ */
+let singleTurnMode = false;
+
 // Mock the SDK's streaming-input mode: emit an init message, then block on the
 // input queue until a second turn arrives, then finish. Blocking on the queue is
 // what makes the test deterministic — the job cannot complete before the test's
@@ -29,16 +40,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
     const generator = (async function* () {
       yield { type: "system", subtype: "init", session_id: "interactive-session" };
 
-      if (typeof input === "string") {
-        // One-shot execute() path — nothing to drain.
-        yield { type: "result", subtype: "success", result: "done" };
-        return;
-      }
-
       for await (const message of input) {
         injectedTurns.push(message.message.content);
         // First turn is the trigger prompt itself; the second is the injection.
-        if (injectedTurns.length >= 2) break;
+        if (singleTurnMode || injectedTurns.length >= 2) break;
       }
 
       yield { type: "result", subtype: "success", result: "done" };
@@ -62,6 +67,7 @@ describe("FleetManager.sendToJob", () => {
 
   beforeEach(async () => {
     injectedTurns.length = 0;
+    singleTurnMode = false;
     tempDir = await mkdtemp(join(tmpdir(), "fleet-send-to-job-"));
     const configDir = join(tempDir, "config");
     stateDir = join(tempDir, ".herdctl");
@@ -165,6 +171,9 @@ describe("FleetManager.sendToJob", () => {
   });
 
   it("returns false for a non-interactive job", async () => {
+    // No handle is ever exposed to inject a second turn on this path — resolve
+    // after the initial prompt instead of blocking for one that never comes.
+    singleTurnMode = true;
     const manager = createManager();
     await manager.initialize();
 
