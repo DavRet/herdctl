@@ -1003,3 +1003,264 @@ describe("SDKRuntime.execute() verify round 2 (4 majors + 2 minors)", () => {
     expect(stream.isClosed()).toBe(true);
   });
 });
+
+// Final verify round on the fixes above (vulpes-pack#206) found 1 blocker +
+// 3 minors, 0 refuted. Round 4 — maxHold reset semantics.
+describe("SDKRuntime.execute() verify round 4 (1 blocker + 3 minors)", () => {
+  it("BLOCKER: a wedged child emitting only heartbeat noise does not reset the maxHold backstop — the backstop still fires with a truthful error", async () => {
+    // clearMaxHold() used to run unconditionally on ANY message — a wedged
+    // child that keeps emitting task_progress/task_notification heartbeats
+    // (proof it's ALIVE, not that it's progressing toward drain) reset the
+    // 2h backstop forever, resurrecting the exact hang BLOCKER-1
+    // (job-2026-08-31-okhjlg) fixed. Heartbeats must not count as progress.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held" } as FakeMessage);
+    await flushMicrotasks();
+
+    // The child is wedged but keeps emitting heartbeat noise every 10
+    // minutes for 110 minutes — none of it real progress. If any of it reset
+    // maxHold, the backstop (armed once at hold-start) would never fire.
+    for (let i = 0; i < 11; i++) {
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      stream.push({
+        type: "tool_progress",
+        tool_use_id: "t1",
+        content: `still working... ${i}`,
+      } as FakeMessage);
+      await flushMicrotasks();
+    }
+    expect(seen.some((m) => m.type === "error")).toBe(false); // not yet — under 2h
+
+    // Cross the 2h mark (110min so far + 15min = 125min total).
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    await drain;
+
+    const errors = seen.filter((m) => m.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].code).toBe("MAX_HOLD_ELAPSED");
+    expect(errors[0].message).toMatch(/timed out/);
+    expect(seen.some((m) => m.type === "result" && m.result === "held")).toBe(false);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("an actively streaming turn (assistant messages) survives past the maxHold window", async () => {
+    // Real progress via assistant content specifically (distinct from the
+    // background_tasks_changed path already covered by the "actively
+    // streaming run survives" test above) resets the backstop.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held" } as FakeMessage);
+    await flushMicrotasks();
+
+    // Assistant content every 50 minutes, well past 2h total, with the
+    // background task reported live throughout (so it never releases via
+    // the grace path — only maxHold could end this, and it must not).
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(50 * 60_000);
+      stream.push({ type: "assistant", message: { content: [`chunk ${i}`] } } as FakeMessage);
+      await flushMicrotasks();
+    }
+    expect(seen.some((m) => m.type === "result" || m.type === "error")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("held");
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("MINOR 1: HERDCTL_RACE_SETTLE_MS parsing — valid, empty, non-finite, and negative overrides", async () => {
+    // Verified indirectly: an invalid override falls back to RACE_SETTLE_MS
+    // rather than crashing or producing a nonsensical (e.g. NaN-based) delay.
+    const cases: Array<{ env: string | undefined; expectSettleMs: number }> = [
+      { env: undefined, expectSettleMs: RACE_SETTLE_MS },
+      { env: "", expectSettleMs: RACE_SETTLE_MS },
+      { env: "not-a-number", expectSettleMs: RACE_SETTLE_MS },
+      { env: "-50", expectSettleMs: RACE_SETTLE_MS },
+      { env: "500", expectSettleMs: 500 },
+    ];
+
+    for (const { env, expectSettleMs } of cases) {
+      if (env === undefined) {
+        delete process.env.HERDCTL_RACE_SETTLE_MS;
+      } else {
+        process.env.HERDCTL_RACE_SETTLE_MS = env;
+      }
+
+      const runtime = new SDKRuntime();
+      const seen: FakeMessage[] = [];
+      const drain = (async () => {
+        for await (const message of runtime.execute(baseOptions())) {
+          seen.push(message);
+        }
+      })();
+
+      await flushMicrotasks();
+      const stream = activeStream!;
+      stream.push({ type: "result", subtype: "success", result: "r" } as FakeMessage);
+      await flushMicrotasks();
+      expect(seen.some((m) => m.type === "result")).toBe(false); // settle armed (first terminal)
+
+      // Just under the expected settle: still held.
+      await vi.advanceTimersByTimeAsync(Math.max(expectSettleMs - 10, 0));
+      expect(seen.some((m) => m.type === "result")).toBe(false);
+
+      // At (or past) the expected settle: released.
+      await vi.advanceTimersByTimeAsync(20);
+      await drain;
+      expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+
+      delete process.env.HERDCTL_RACE_SETTLE_MS;
+    }
+  });
+
+  it("MINOR 3: HERDCTL_MAX_HOLD_MS overrides the inactivity backstop duration", async () => {
+    process.env.HERDCTL_MAX_HOLD_MS = "60000"; // 1 minute, instead of the 2h default
+
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held" } as FakeMessage);
+    await flushMicrotasks();
+
+    // Well under the overridden 1-minute bound: still held.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(seen.some((m) => m.type === "error")).toBe(false);
+
+    // Past the overridden bound (nothing but silence since):
+    await vi.advanceTimersByTimeAsync(31_000);
+    await drain;
+
+    const errors = seen.filter((m) => m.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].code).toBe("MAX_HOLD_ELAPSED");
+    expect(errors[0].message).toMatch(/60000ms/);
+
+    delete process.env.HERDCTL_MAX_HOLD_MS;
+  });
+
+  it("MINOR 1 clamp: an oversized HERDCTL_RACE_SETTLE_MS is capped at half the maxHold window", async () => {
+    process.env.HERDCTL_MAX_HOLD_MS = "1000"; // 1s, so half is 500ms
+    process.env.HERDCTL_RACE_SETTLE_MS = "10000"; // way more than half of maxHold
+
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({ type: "result", subtype: "success", result: "r" } as FakeMessage);
+    await flushMicrotasks();
+
+    // Settle should be clamped to 500ms (half of the 1s maxHold), not 10s —
+    // released well before maxHold could ever fire.
+    await vi.advanceTimersByTimeAsync(500);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    // Released as a normal result, not a forced MAX_HOLD_ELAPSED error —
+    // proves the settle didn't invert past the backstop.
+    expect(seen.some((m) => m.type === "error")).toBe(false);
+
+    delete process.env.HERDCTL_MAX_HOLD_MS;
+    delete process.env.HERDCTL_RACE_SETTLE_MS;
+  });
+
+  it("MINOR 2: a redundant message during a SHORT settle window re-arms the SAME short settle, not the long reinvocation grace", async () => {
+    // A run that has touched background work before gets the settle window
+    // (not the reinvocation grace) on ITS OWN second-and-later terminal too
+    // (verify round 3). A redundant message mid-settle must restore that
+    // same short window, not upgrade to the 15s reinvocation wait.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+
+    // First background task, established sawBackgroundActivity, then drains.
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "first turn" } as FakeMessage);
+    await flushMicrotasks();
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks(); // reinvocation grace (15s) armed
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS / 2);
+    stream.push({ type: "result", subtype: "success", result: "second turn" } as FakeMessage);
+    await flushMicrotasks(); // this terminal's own settle window (250ms) armed — sawBackgroundActivity=true
+
+    // A redundant message arrives mid-settle — must re-arm the SAME short
+    // settle, not upgrade to the 15s reinvocation grace.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS / 2);
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] }); // redundant, already 0
+    await flushMicrotasks();
+
+    // If this incorrectly upgraded to the 15s grace, the run would still be
+    // held here; if it correctly re-armed the short settle, advancing just
+    // past another full settle window releases it.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS + 10);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("second turn");
+    expect(stream.isClosed()).toBe(true);
+  });
+});

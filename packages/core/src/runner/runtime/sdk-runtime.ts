@@ -89,11 +89,31 @@ const REINVOCATION_GRACE_ELAPSED = Symbol("reinvocation-grace-elapsed");
  */
 export const RACE_SETTLE_MS = 250;
 
+/**
+ * Duration of the absolute last-resort inactivity backstop — see
+ * `maxHoldPromise` in {@link SDKRuntime.execute}. Defaults to
+ * {@link DEFAULT_SESSION_TIMEOUT_MS} (2h), the confirmed operational ceiling
+ * for a silently-grinding background child. `HERDCTL_MAX_HOLD_MS` overrides
+ * it (verify round 4 #206), same parse pattern as `HERDCTL_RACE_SETTLE_MS`.
+ */
+function maxHoldMs(): number {
+  const raw = process.env.HERDCTL_MAX_HOLD_MS;
+  if (raw === undefined || raw === "") return DEFAULT_SESSION_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SESSION_TIMEOUT_MS;
+}
+
 function raceSettleMs(): number {
   const raw = process.env.HERDCTL_RACE_SETTLE_MS;
-  if (raw === undefined || raw === "") return RACE_SETTLE_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : RACE_SETTLE_MS;
+  let ms = RACE_SETTLE_MS;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) ms = parsed;
+  }
+  // #206 review MINOR 1: clamp so a misconfigured settle can never invert
+  // settle-vs-maxHold ordering into a false MAX_HOLD_ELAPSED (the settle
+  // racing past the inactivity backstop it's nested inside of).
+  return Math.min(ms, maxHoldMs() / 2);
 }
 
 /**
@@ -386,7 +406,14 @@ export class SDKRuntime implements RuntimeInterface {
     // time; any message in between cancels it (see the top of the loop).
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let gracePromise: Promise<typeof REINVOCATION_GRACE_ELAPSED> | undefined;
+    // Remembers which grace duration was last armed — NOT cleared by
+    // `clearGrace()` (#206 review MINOR 2). The catch-all re-arm branch below
+    // needs this to restore the SAME kind of grace a redundant message
+    // interrupted, rather than defaulting to `sawBackgroundActivity` and
+    // upgrading an interrupted short settle into the long reinvocation wait.
+    let activeGraceMs: number | undefined;
     const armGrace = (ms: number): void => {
+      activeGraceMs = ms;
       gracePromise = new Promise((resolve) => {
         graceTimer = setTimeout(() => resolve(REINVOCATION_GRACE_ELAPSED), ms);
         graceTimer.unref?.();
@@ -406,25 +433,36 @@ export class SDKRuntime implements RuntimeInterface {
     // whole call — armed once before the loop and never reset, it killed a
     // healthy, actively-streaming run at exactly 2h regardless of activity,
     // the same "kill healthy work" class the original ceiling removal (#458)
-    // fixed, just relocated. So instead it's armed/cleared on the exact same
-    // schedule as `gracePromise` (cleared on any message below, re-armed at
-    // the end of the decision block below whenever still holding) — it only
-    // ever measures a stretch of ABSOLUTE SILENCE while a terminal is held,
-    // for the case a background child crashes without ever reporting a final
-    // `background_tasks_changed` (or the event is silently dropped): without
-    // this, that specific silence would hold forever, since nothing else
-    // would ever arm a release. On firing, the held terminal is DISCARDED in
-    // favor of a synthetic error (`maxHoldError` below, MAJOR B: worded from
-    // the actual `liveBackgroundTasks` state at the moment, not a hardcoded
-    // claim) — this must never surface as a silent "success" on a stale
-    // result, matching JobExecutor's truthful-close marker
+    // fixed, just relocated. So instead it's armed/cleared alongside
+    // `gracePromise` — but NOT on the exact same trigger any more (verify
+    // round 4 BLOCKER): resetting it on ANY message, including heartbeat/
+    // system noise a wedged child can emit forever (`tool_progress`, a
+    // `task_notification`, ...), defeated the backstop just as completely as
+    // never resetting it at all — a wedged child that keeps emitting noise
+    // never dies. It's now cleared (see `isRealProgress` in the loop below)
+    // only by messages that evidence ACTUAL lifecycle progress: an assistant/
+    // user/tool_result message (a turn is actively streaming), an
+    // authoritative background_tasks_changed report (the task set actually
+    // changed state), or a fresh terminal (the hold phase ends or restarts).
+    // It only ever measures a stretch where NOTHING but noise (or literally
+    // nothing) arrives while a terminal is held — for the case a background
+    // child crashes without ever reporting a final `background_tasks_changed`
+    // (or the event is silently dropped), or hangs while still emitting
+    // heartbeats: without this, that stretch would hold forever, since
+    // nothing else would ever arm a release. On firing, the held terminal is
+    // DISCARDED in favor of a synthetic error (`maxHoldError` below, MAJOR B:
+    // worded from the actual `liveBackgroundTasks` state at the moment, not a
+    // hardcoded claim) — this must never surface as a silent "success" on a
+    // stale result, matching JobExecutor's truthful-close marker
     // (`endedWithLiveBackgroundTasks`), which reads this the same way it
-    // already reads any other stream-level error.
+    // already reads any other stream-level error. `HERDCTL_MAX_HOLD_MS`
+    // overrides the 2h default (David confirmed 2h as the operational
+    // ceiling; the env var is purely an escape hatch, not a design change).
     let maxHoldTimer: ReturnType<typeof setTimeout> | undefined;
     let maxHoldPromise: Promise<typeof MAX_HOLD_ELAPSED> | undefined;
     const armMaxHold = (): void => {
       maxHoldPromise = new Promise((resolve) => {
-        maxHoldTimer = setTimeout(() => resolve(MAX_HOLD_ELAPSED), DEFAULT_SESSION_TIMEOUT_MS);
+        maxHoldTimer = setTimeout(() => resolve(MAX_HOLD_ELAPSED), maxHoldMs());
         maxHoldTimer.unref?.();
       });
     };
@@ -445,7 +483,7 @@ export class SDKRuntime implements RuntimeInterface {
         // "timed out" is deliberate wording, not just description — job-executor's
         // `classifyError` substring-matches it to exit_reason "timeout", the same
         // classification the openSession path's own sessionTimeoutMs backstop gets.
-        message: `execute() timed out after ${DEFAULT_SESSION_TIMEOUT_MS}ms of inactivity while holding (${state}) — forcibly ending`,
+        message: `execute() timed out after ${maxHoldMs()}ms of inactivity (no real lifecycle progress, heartbeat noise aside) while holding (${state}) — forcibly ending`,
         code: "MAX_HOLD_ELAPSED",
       } as unknown as SDKMessage;
     };
@@ -470,21 +508,23 @@ export class SDKRuntime implements RuntimeInterface {
         if (nextResult === REINVOCATION_GRACE_ELAPSED) break; // nothing new arrived; yield the held terminal below
         if (nextResult.done) break;
 
-        // Any message is activity — cancel a pending grace (and the maxHold
-        // inactivity clock) outright, whether it's the long reinvocation
-        // grace or the short ordering-race settle (SessionReaper's own
-        // "activity cancels the pending reap" contract, session-reaper.ts).
-        // This does NOT mean the run is done: it means "keep holding
-        // unconditionally" until a fresh terminal supersedes the stale one,
-        // or the decision below re-arms a fresh grace for the new state.
-        // Re-arming a plain pass-through message onto an ALREADY reinvoked
-        // turn's own content — instead of letting it silently outlive a
-        // grace it never touched — is exactly what closes the case where a
-        // genuine re-invocation streams for longer than the grace window: it
-        // now just keeps resetting the timer as long as content keeps
-        // arriving, same as SessionReaper's `activity` signal.
+        // Any message cancels a pending GRACE (the reinvocation wait or the
+        // ordering-race settle) outright — SessionReaper's own "activity
+        // cancels the pending reap" contract, session-reaper.ts. This does
+        // NOT mean the run is done: it means "keep holding unconditionally"
+        // until a fresh terminal supersedes the stale one, or the decision
+        // below re-arms a fresh grace for the new state. Re-arming a plain
+        // pass-through message onto an ALREADY reinvoked turn's own content
+        // — instead of letting it silently outlive a grace it never touched
+        // — is exactly what closes the case where a genuine re-invocation
+        // streams for longer than the grace window: it now just keeps
+        // resetting the timer as long as content keeps arriving, same as
+        // SessionReaper's `activity` signal.
+        //
+        // The maxHold INACTIVITY backstop is deliberately NOT cleared here
+        // unconditionally any more (verify round 4 BLOCKER) — see
+        // `isRealProgress` below, computed once the message's type is known.
         clearGrace();
-        clearMaxHold();
 
         const message = nextResult.value;
         // Read synchronously off the raw message — NOT "ahead of"
@@ -502,11 +542,11 @@ export class SDKRuntime implements RuntimeInterface {
         // themselves report a task count, the same way the pre-#458 ceiling
         // logic did: the next message, whatever it is, is what surfaces a
         // signal the hook delivered in between.
-        if (
-          message &&
-          (message as { type?: string }).type === "system" &&
-          (message as { subtype?: string }).subtype === "background_tasks_changed"
-        ) {
+        const msgType = (message as { type?: string } | undefined)?.type;
+        const isBackgroundTasksChangedMsg =
+          msgType === "system" &&
+          (message as { subtype?: string }).subtype === "background_tasks_changed";
+        if (isBackgroundTasksChangedMsg) {
           noteBackgroundTasks(
             ((message as { tasks?: BackgroundTaskSummary[] }).tasks as BackgroundTaskSummary[]) ??
               [],
@@ -518,6 +558,28 @@ export class SDKRuntime implements RuntimeInterface {
         // "was this the first terminal we've EVER seen" — a SECOND terminal
         // arriving later correctly reads false.
         const isFirstTerminal = isFreshTerminal && !firstTerminalSeen;
+
+        // #206 review verify round 4 BLOCKER: the maxHold inactivity
+        // backstop must only reset on messages that evidence REAL lifecycle
+        // progress — an assistant/user/tool_result message (a turn is
+        // actively streaming), an authoritative background_tasks_changed
+        // report (the task set actually changed), or a fresh terminal (the
+        // hold phase ends or restarts). Heartbeat/system noise (`tool_progress`,
+        // a `task_notification`, `auth_status`, ...) proves the child is
+        // ALIVE, not that it's progressing toward drain — resetting on it
+        // let a wedged child that emits steady noise reset the 2h backstop
+        // forever, resurrecting the exact hang BLOCKER-1 (job-2026-08-31-
+        // okhjlg) fixed.
+        const isRealProgress =
+          isFreshTerminal ||
+          isBackgroundTasksChangedMsg ||
+          msgType === "assistant" ||
+          msgType === "user" ||
+          msgType === "tool_result";
+        if (isRealProgress) {
+          clearMaxHold();
+        }
+
         if (isFreshTerminal) {
           // Supersedes any terminal already held — e.g. a re-invocation turn
           // (the background task's own completion) produces a newer one.
@@ -572,12 +634,28 @@ export class SDKRuntime implements RuntimeInterface {
             // this unarmed would strand an otherwise-COMPLETE run on
             // `maxHoldPromise`'s multi-hour backstop and report a false
             // failure on what should have been a clean, on-time success.
-            armGrace(sawBackgroundActivity ? DEFAULT_REINVOCATION_GRACE_MS : raceSettleMs());
+            //
+            // Restore the SAME grace `activeGraceMs` remembers (#206 review
+            // MINOR 2) rather than guessing from `sawBackgroundActivity` —
+            // that guess upgraded an interrupted short settle (armed for a
+            // SECOND-and-later terminal in a run that HAS touched background
+            // work, which also uses the settle per verify round 3) into the
+            // long reinvocation wait. `activeGraceMs` is only unset if this
+            // branch were somehow reached before any grace had ever armed
+            // for the currently-held terminal, which the loop's own
+            // structure rules out — the fallback is defensive, not expected
+            // to fire.
+            armGrace(
+              activeGraceMs ??
+                (sawBackgroundActivity ? DEFAULT_REINVOCATION_GRACE_MS : raceSettleMs()),
+            );
           }
           // Reached only when none of the branches above broke out of the
           // loop — still holding past this message. Keep the inactivity
-          // backstop engaged for whatever comes next, or doesn't.
-          armMaxHold();
+          // backstop engaged: only actually (re-)arm it if `isRealProgress`
+          // cleared it above, or it was never armed yet for this hold —
+          // both cases collapse to "no timer currently ticking".
+          if (!maxHoldPromise) armMaxHold();
         }
       }
 
