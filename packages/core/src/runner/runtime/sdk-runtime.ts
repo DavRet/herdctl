@@ -17,6 +17,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { buildLifecycleHooks, tapLifecycleStream } from "../../session/session-hooks.js";
+import { DEFAULT_REINVOCATION_GRACE_MS } from "../../session/session-reaper.js";
 import type { SessionLifecycleSignal } from "../../session/types.js";
 import { isTerminalMessage } from "../message-processor.js";
 import { toSDKOptions } from "../sdk-adapter.js";
@@ -27,22 +28,26 @@ import type { RuntimeExecuteOptions, RuntimeInterface, RuntimeSession } from "./
 import { MessageQueue } from "./message-queue.js";
 
 /**
- * Ceiling for holding a one-shot `execute()` run's terminal message while a
- * `run_in_background` Agent-tool subagent it spawned is still live (issue #458).
- * Mirrors `claude -p`'s own `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default
- * 10 min since Claude Code 2.1.182; `0` disables the wait) — the SDK runtime
- * gets the same background-subagent grace the CLI runtime already gets.
+ * Sentinel distinguishing "the reinvocation grace elapsed" from a real message
+ * in the `Promise.race` below.
+ *
+ * There used to be a fixed ceiling here (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`,
+ * default 10 min) that raced the WHOLE hold, live tasks or not — removed after
+ * job-2026-08-31-okhjlg: it killed a legitimate >10min Figma build mid-work and
+ * the job still reported "success" with the stale pre-kill result (see
+ * job-executor.ts's `endedWithLiveBackgroundTasks` for the truthful-close half
+ * of that fix). While tasks are live there is now no time limit at all — the
+ * SessionReaper is the policy for "how long does live background work get to
+ * run", not this loop. The only timer left is this grace, and it only ever
+ * arms once background_tasks_changed reports the set drained to empty: a
+ * one-shot query() gets no re-invocation turn of its own the way a persistent
+ * openSession() session does, so this gives a follow-up turn (the SDK handing
+ * back the child's result) `DEFAULT_REINVOCATION_GRACE_MS` (same 15s window
+ * `SessionReaper` gives a re-invocation before reaping, session-reaper.ts) to
+ * show up before releasing the held terminal. Any new message arriving during
+ * the grace cancels it — that IS the follow-up turn announcing itself.
  */
-const DEFAULT_BG_WAIT_CEILING_MS = 10 * 60_000;
-function bgWaitCeilingMs(): number {
-  const raw = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
-  if (raw === undefined || raw === "") return DEFAULT_BG_WAIT_CEILING_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BG_WAIT_CEILING_MS;
-}
-
-/** Sentinel distinguishing "the ceiling timer won the race" from a real message. */
-const BG_WAIT_TIMED_OUT = Symbol("bg-wait-timed-out");
+const REINVOCATION_GRACE_ELAPSED = Symbol("reinvocation-grace-elapsed");
 
 /**
  * Build a streaming-input user message from plain text.
@@ -208,17 +213,31 @@ export class SDKRuntime implements RuntimeInterface {
     // borrowing openSession()'s streaming-input + lifecycle-hook wiring: a
     // queue-backed prompt keeps the underlying query open, the Stop/
     // background_tasks_changed hooks report whether background work is still
-    // live, and the terminal message is held back (up to bgWaitCeilingMs, the
-    // same grace `claude -p` gives via `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`)
-    // until it drains — instead of tearing the session down out from under it.
-    // Updated two ways: synchronously in this loop below (from the same
-    // `background_tasks_changed` stream message `tapLifecycleStream` reacts
-    // to — inspected directly here, not via its `sink`, which fires on a
+    // live, and the terminal message is held back until it drains — instead of
+    // tearing the session down out from under it. See REINVOCATION_GRACE_ELAPSED
+    // above for how long, and why there's no longer a ceiling on the "still
+    // live" case. Updated two ways: synchronously in this loop below (from the
+    // same `background_tasks_changed` stream message `tapLifecycleStream`
+    // reacts to — inspected directly here, not via its `sink`, which fires on a
     // deferred microtask and would race the very message that triggered it),
     // and from the Stop hook's authoritative end-of-turn snapshot via
     // `onLifecycleSignal` below (fine to be async there — nothing in this
     // loop is waiting on that same tick).
     let liveBackgroundTasks: BackgroundTaskSummary[] = [];
+    // Set exactly once per genuine "was live, now drained to empty" transition
+    // — NOT on every message seen while already at zero. Distinguishes "this
+    // run never had background work" (release a held terminal immediately, the
+    // common/fast path — see the pendingTerminal check below) from "tasks just
+    // drained" (worth a short grace for a follow-up turn). Consumed (reset
+    // false) the moment the grace it earns gets armed, so a later terminal
+    // that's already draining-with-nothing-new doesn't re-arm a second grace.
+    let justDrained = false;
+    const noteBackgroundTasks = (tasks: BackgroundTaskSummary[]) => {
+      if (liveBackgroundTasks.length > 0 && tasks.length === 0) {
+        justDrained = true;
+      }
+      liveBackgroundTasks = tasks;
+    };
     const trackBackgroundTasks = (signal: SessionLifecycleSignal) => {
       // `activity` and `cron_deleted` carry no task snapshot (always `[]`,
       // see SessionLifecycleSignal's own doc) — only `turn_end` and
@@ -236,7 +255,7 @@ export class SDKRuntime implements RuntimeInterface {
         (signal.kind === "turn_end" || signal.kind === "background_tasks_changed") &&
         signal.hasSnapshot !== false
       ) {
-        liveBackgroundTasks = signal.backgroundTasks;
+        noteBackgroundTasks(signal.backgroundTasks);
       }
     };
     // Compose: this internal bg-wait tracker runs first and synchronously (the
@@ -284,46 +303,61 @@ export class SDKRuntime implements RuntimeInterface {
     );
     const iterator = messages[Symbol.asyncIterator]();
 
-    const ceilingMs = bgWaitCeilingMs();
     let pendingTerminal: SDKMessage | undefined;
-    // Armed once, on the first message we hold back — a single deadline for
-    // the whole wait, not reset per message.
-    let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
-    let ceilingPromise: Promise<typeof BG_WAIT_TIMED_OUT> | undefined;
-    const armCeiling = (): Promise<typeof BG_WAIT_TIMED_OUT> => {
-      if (!ceilingPromise) {
-        ceilingPromise = new Promise((resolve) => {
-          ceilingTimer = setTimeout(() => resolve(BG_WAIT_TIMED_OUT), ceilingMs);
-          ceilingTimer.unref?.();
-        });
+    // Armed only once tasks drain to empty (see `justDrained` above) — not a
+    // fixed ceiling on the whole hold. Re-armed fresh each time a genuine new
+    // drain transition earns one; any message in between cancels it.
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let gracePromise: Promise<typeof REINVOCATION_GRACE_ELAPSED> | undefined;
+    const armGrace = (): void => {
+      gracePromise = new Promise((resolve) => {
+        graceTimer = setTimeout(
+          () => resolve(REINVOCATION_GRACE_ELAPSED),
+          DEFAULT_REINVOCATION_GRACE_MS,
+        );
+        graceTimer.unref?.();
+      });
+    };
+    const clearGrace = (): void => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = undefined;
       }
-      return ceilingPromise;
+      gracePromise = undefined;
     };
 
     try {
       while (true) {
-        const nextResult = pendingTerminal
-          ? await Promise.race([iterator.next(), armCeiling()])
+        const nextResult = gracePromise
+          ? await Promise.race([iterator.next(), gracePromise])
           : await iterator.next();
 
-        if (nextResult === BG_WAIT_TIMED_OUT) break; // ceiling hit; yield the held terminal below
+        if (nextResult === REINVOCATION_GRACE_ELAPSED) break; // no follow-up turn arrived; yield the held terminal below
         if (nextResult.done) break;
 
         const message = nextResult.value;
         // Read synchronously off the raw message, ahead of (and independent
         // from) tapLifecycleStream's own deferred `sink` call for the same
-        // message — see the comment on `liveBackgroundTasks` above.
+        // message — see the comment on `liveBackgroundTasks` above. That sink
+        // is also how an authoritative turn_end Stop-hook signal updates this
+        // state: fully out of band from THIS loop's `iterator.next()`, so the
+        // decision below re-checks on every message (not just ones that
+        // themselves report a task count) the same way the pre-#458 ceiling
+        // logic did — the next message, whatever it is, is what surfaces a
+        // signal the hook delivered in between.
         if (
           message &&
           (message as { type?: string }).type === "system" &&
           (message as { subtype?: string }).subtype === "background_tasks_changed"
         ) {
-          liveBackgroundTasks =
+          noteBackgroundTasks(
             ((message as { tasks?: BackgroundTaskSummary[] }).tasks as BackgroundTaskSummary[]) ??
-            [];
+              [],
+          );
         }
 
-        if (isTerminalMessage(message)) {
+        const isFreshTerminal = isTerminalMessage(message);
+        if (isFreshTerminal) {
           // Supersedes any terminal already held — e.g. a re-invocation turn
           // (the background task's own completion) produces a newer one.
           pendingTerminal = message;
@@ -335,10 +369,35 @@ export class SDKRuntime implements RuntimeInterface {
         }
 
         if (pendingTerminal) {
-          // ceilingMs === 0 mirrors `-p`'s "0 = don't wait" — stop holding
-          // immediately rather than arming a zero-length timer.
-          if (liveBackgroundTasks.length === 0 || ceilingMs === 0) break;
-          // else: keep looping, still holding.
+          if (liveBackgroundTasks.length > 0) {
+            // Still (or newly) live — cancel any armed grace, hold unconditionally.
+            clearGrace();
+          } else if (isFreshTerminal) {
+            // A fresh terminal with nothing left live IS the resolution a
+            // grace (if any was ticking) exists to wait for — done now,
+            // whatever time was left on it. Also the "never had background
+            // work" fast path: nothing was ever armed, so this just yields
+            // immediately, same as before #458.
+            clearGrace();
+            break;
+          } else if (justDrained) {
+            // A genuine drain-to-empty transition, not itself a terminal:
+            // give a follow-up turn a short grace before giving up on it.
+            // A PLAIN pass-through message must never reach this branch and
+            // must never cancel an already-armed grace either — only a fresh
+            // terminal (above) or a genuine new drain does; getting that
+            // wrong previously released the stale held terminal the instant
+            // any follow-up content arrived, instead of waiting for ITS
+            // terminal.
+            justDrained = false;
+            armGrace();
+          } else if (!gracePromise) {
+            // Nothing live, no fresh transition, and no grace already
+            // ticking from an earlier one: genuinely nothing left to wait for.
+            break;
+          }
+          // else: a grace armed by an earlier drain is still ticking and
+          // this message didn't change anything — let it run its course.
         }
       }
 
@@ -349,7 +408,7 @@ export class SDKRuntime implements RuntimeInterface {
       // q.return() — would never run, leaking the query.
       if (pendingTerminal) yield pendingTerminal;
     } finally {
-      if (ceilingTimer) clearTimeout(ceilingTimer);
+      clearGrace();
       input.end();
       try {
         await q.return(undefined);

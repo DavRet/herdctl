@@ -1,12 +1,22 @@
 /**
- * issue #458: a one-shot `execute()` run must not hand JobExecutor the
- * terminal message (letting it tear the query down) while a
- * `run_in_background` Agent-tool subagent it spawned is still live — it
- * should hold the terminal message until `background_tasks_changed` reports
- * an empty set, capped by `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`.
+ * issue #458 / operator decision after job-2026-08-31-okhjlg: a one-shot
+ * `execute()` run must not hand JobExecutor the terminal message (letting it
+ * tear the query down) while a `run_in_background` Agent-tool subagent it
+ * spawned is still live — it holds the terminal message until
+ * `background_tasks_changed` reports an empty set.
+ *
+ * There used to be a fixed `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` ceiling
+ * (default 10 min) that raced the WHOLE hold, live tasks or not. It was
+ * removed: it silently killed a legitimate >10min Figma build mid-work and
+ * the job still reported "success" with the stale pre-kill result. While
+ * tasks are live there is now no time limit at all. The only timer left is a
+ * short `DEFAULT_REINVOCATION_GRACE_MS` (15s) grace that arms once the task
+ * set drains to empty, giving a follow-up turn (the SDK re-invoking with the
+ * child's result) a chance to show up before the held terminal is released.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_REINVOCATION_GRACE_MS } from "../../../session/session-reaper.js";
 
 type FakeMessage = Record<string, unknown>;
 
@@ -101,13 +111,22 @@ function baseOptions(overrides: Partial<RuntimeExecuteOptions> = {}): RuntimeExe
   return { prompt: "hi", agent, ...overrides };
 }
 
-afterEach(() => {
-  activeStream = undefined;
-  delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+/** Let the fake-timer event loop flush pending microtasks without advancing time. */
+async function flushMicrotasks(): Promise<void> {
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
 });
 
-describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
-  it("holds the terminal result until background_tasks_changed reports empty", async () => {
+afterEach(() => {
+  activeStream = undefined;
+  vi.useRealTimers();
+});
+
+describe("SDKRuntime.execute() background-task hold (issue #458, no ceiling — job-2026-08-31-okhjlg)", () => {
+  it("releases immediately when no background task is ever reported", async () => {
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -116,29 +135,123 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       }
     })();
 
-    // Let execute() start and register its iterator.
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
+    stream.push({ type: "result", subtype: "success" });
 
+    await drain; // no grace armed at all — resolves without any timer advance
+    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("holds the terminal result with NO time limit while a background task stays live", async () => {
+    // Regression for job-2026-08-31-okhjlg: a legitimate long-running build
+    // must never be force-closed just because it outlives some fixed window.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
     stream.push({
       type: "system",
       subtype: "background_tasks_changed",
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false);
 
-    // Give the loop a couple of ticks to process both messages.
-    await new Promise((r) => setTimeout(r, 10));
+    // Simulate well over 10 minutes — the old ceiling's default — with the
+    // task still reported live and nothing else arriving.
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+
+    // The task finally drains: releases via the reinvocation grace below,
+    // not instantly — confirms the run was genuinely still open, not wedged.
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false); // grace still pending
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("releases the held terminal once the reinvocation grace elapses with no follow-up turn", async () => {
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success" });
+    await flushMicrotasks();
     // Non-terminal messages (like the background_tasks_changed system message
     // itself) still pass straight through — only the terminal `result` is held.
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    // Drained, grace armed — not released yet.
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
 
     // Both background_tasks_changed messages passed through as normal
-    // content; the terminal result was released only once tasks drained.
+    // content; the terminal result was released only once the grace elapsed.
     expect(seen.map((m) => m.type)).toEqual(["system", "system", "result"]);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("cancels the grace and delivers the follow-up turn's own fresh terminal", async () => {
+    // The case the grace exists for: a re-invocation DOES arrive within the
+    // window, so the stale held terminal is superseded rather than released.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "first turn" });
+    await flushMicrotasks();
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+
+    // Well within the grace window, the child's re-invocation shows up.
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS / 2);
+    stream.push({ type: "assistant", message: { content: [] } });
+    stream.push({ type: "result", subtype: "success", result: "second turn" });
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("second turn"); // the stale first-turn result never surfaced
     expect(stream.isClosed()).toBe(true);
   });
 
@@ -155,7 +268,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -164,67 +277,19 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     // An assistant message is what tapLifecycleStream treats as `activity` —
     // must NOT clear the held task count.
     stream.push({ type: "assistant", message: { content: [] } });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
-  });
-
-  it("does not hold the terminal result when ceiling is 0", async () => {
-    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
-    const runtime = new SDKRuntime();
-    const seen: FakeMessage[] = [];
-    const drain = (async () => {
-      for await (const message of runtime.execute(baseOptions())) {
-        seen.push(message);
-      }
-    })();
-
-    await new Promise((r) => setTimeout(r, 0));
-    const stream = activeStream!;
-    stream.push({
-      type: "system",
-      subtype: "background_tasks_changed",
-      tasks: [{ task_id: "t1" }],
-    });
-    stream.push({ type: "result", subtype: "success" });
-
-    await drain;
-    expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
-    expect(stream.isClosed()).toBe(true);
-  });
-
-  it("gives up and yields the terminal once the ceiling elapses", async () => {
-    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "20";
-    const runtime = new SDKRuntime();
-    const seen: FakeMessage[] = [];
-    const drain = (async () => {
-      for await (const message of runtime.execute(baseOptions())) {
-        seen.push(message);
-      }
-    })();
-
-    await new Promise((r) => setTimeout(r, 0));
-    const stream = activeStream!;
-    stream.push({
-      type: "system",
-      subtype: "background_tasks_changed",
-      tasks: [{ task_id: "t1" }],
-    });
-    stream.push({ type: "result", subtype: "success" });
-    // Background task never drains — no further push.
-
-    await drain; // resolves once the 20ms ceiling fires
-    const results = seen.filter((m) => m.type === "result");
-    expect(results).toHaveLength(1);
-    expect(stream.isClosed()).toBe(true);
   });
 
   it("does not release the held terminal on a turn_end Stop hook fired without a background_tasks snapshot", async () => {
@@ -244,7 +309,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -253,7 +318,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     // Simulate the CLI firing Stop without the background_tasks/session_crons
@@ -270,17 +335,20 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     // re-evaluates on the next stream message, not on the out-of-band hook
     // call itself) with a message that carries no task snapshot of its own.
     stream.push({ type: "assistant", message: { content: [] } });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
 
   it("releases the held terminal on a turn_end Stop hook that authoritatively reports empty background_tasks", async () => {
     // Counter-check: a genuine empty snapshot (the field present, just empty)
-    // must still release as before — only an omitted field is a non-snapshot.
+    // must still count as a real drain (and earn the same grace) — only an
+    // omitted field is a non-snapshot.
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -289,7 +357,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -298,7 +366,7 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     const stopCallback = stopCallbackFromLastQueryCall();
@@ -314,7 +382,8 @@ describe("SDKRuntime.execute() background-task hold (issue #458)", () => {
     // Force the execute() loop to re-check its release condition — see the
     // no-snapshot test above for why this is needed.
     stream.push({ type: "assistant", message: { content: [] } });
-
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
@@ -339,7 +408,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -347,10 +416,10 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       subtype: "background_tasks_changed",
       tasks: [{ task_id: "t1" }],
     });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     stream.push({ type: "assistant", message: { content: [] } });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     const postToolUseCallback = postToolUseCallbackFromLastQueryCall();
     await postToolUseCallback({
@@ -362,7 +431,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       tool_input: { id: "c1" },
       tool_response: {},
     });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     const stopCallback = stopCallbackFromLastQueryCall();
     await stopCallback({
@@ -374,9 +443,11 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       background_tasks: [],
       session_crons: [{ id: "c2", schedule: "+60s", recurring: false, prompt: "WAKE" }],
     });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     stream.push({ type: "result", subtype: "success" });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
 
     const kinds = signals.map((s) => s.kind);
@@ -408,7 +479,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -417,7 +488,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     // A turn_end fired without the background_tasks/session_crons envelope —
@@ -431,10 +502,12 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       stop_hook_active: false,
     });
     stream.push({ type: "assistant", message: { content: [] } });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
 
@@ -455,7 +528,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -465,11 +538,13 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
     });
     stream.push({ type: "assistant", message: { content: [] } });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     // Terminal still held (the throwing consumer didn't corrupt bg-task tracking).
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
 
     // Every non-terminal message still reached the consumer of the stream itself.
@@ -487,7 +562,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -496,10 +571,12 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
 
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
@@ -519,7 +596,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       }
     })();
 
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMicrotasks();
     const stream = activeStream!;
 
     stream.push({
@@ -528,7 +605,7 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       tasks: [{ task_id: "t1" }],
     });
     stream.push({ type: "result", subtype: "success" });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
     // Authoritative turn_end reports BOTH a live background task and a pending
     // session cron in the same snapshot.
@@ -543,9 +620,11 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
       session_crons: [{ id: "c1", schedule: "+60s", recurring: false, prompt: "WAKE" }],
     });
     stream.push({ type: "assistant", message: { content: [] } });
-    await new Promise((r) => setTimeout(r, 10));
+    await flushMicrotasks();
 
-    // Still held — the task is live per the authoritative snapshot.
+    // Still held — the task is live per the authoritative snapshot. No grace
+    // was armed either (never drained), so a long wait changes nothing.
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(seen.some((m) => m.type === "result")).toBe(false);
     const turnEnd = signals.find((s) => s.kind === "turn_end");
     expect(turnEnd?.sessionCrons).toEqual([
@@ -553,6 +632,8 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
     ]);
 
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
   });
