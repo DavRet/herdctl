@@ -289,6 +289,7 @@ program
   .description("Manually trigger an agent")
   .option("-S, --schedule <name>", "Trigger specific schedule")
   .option("-p, --prompt <prompt>", "Custom prompt")
+  .option("--session-key <key>", "Session key to run under (default: the agent's qualified name)")
   .option("-w, --wait", "Wait for job to complete and stream logs")
   .option("-q, --quiet", "Suppress output display (just show job info)")
   .option("--json", "Output as JSON for scripting")
@@ -299,6 +300,7 @@ program
       await triggerCommand(agent, {
         schedule: options.schedule,
         prompt: options.prompt,
+        sessionKey: options.sessionKey,
         wait: options.wait,
         quiet: options.quiet,
         json: options.json,

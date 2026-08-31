@@ -24,6 +24,7 @@ import {
 export interface TriggerOptions {
   schedule?: string;
   prompt?: string;
+  sessionKey?: string;
   wait?: boolean;
   json?: boolean;
   state?: string;
@@ -269,6 +270,7 @@ export async function triggerCommand(agentName: string, options: TriggerOptions)
     try {
       result = await manager.trigger(agentName, options.schedule, {
         prompt: options.prompt,
+        sessionKey: options.sessionKey,
         onMessage,
       });
     } catch (error) {
