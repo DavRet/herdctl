@@ -3210,6 +3210,61 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
     expect(job?.status).toBe("completed");
   });
 
+  it("does not close on injection-grace expiry while a background task is still live, and the ceiling releases it", async () => {
+    // Regression for the CodeRabbit finding on the vulpes-pack sibling patch
+    // (PR #181): a terminal with BOTH pendingInjected>0 AND a live background
+    // task used to take the pendingInjected branch only, leaving the bg-wait
+    // ceiling unarmed — the injection-grace timer then closed the session on
+    // its own once it expired, killing the still-live child.
+    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "60";
+
+    const warnings: string[] = [];
+    const logger = {
+      ...createMockLogger(),
+      warn: (message: string) => warnings.push(message),
+    };
+
+    // No onSend follow-up and the background task never drains: neither the
+    // injected message nor the child ever produces a second result.
+    const { runtime, state } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "held result" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "bg-and-injected-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 20,
+      onSessionOpen: (handle) => {
+        handle.send("never answered");
+      },
+    });
+
+    // The grace window expired first (20ms < 60ms ceiling) but held instead
+    // of closing, because the background task was still live.
+    expect(
+      warnings.some((w) => /injection grace expired but a background task is still live/.test(w)),
+    ).toBe(true);
+    // The ceiling — armed alongside pendingInjected, not blocked by it —
+    // is what actually ends the run.
+    expect(warnings.some((w) => /background task still running after 60ms ceiling/.test(w))).toBe(
+      true,
+    );
+    expect(state.closed).toBeGreaterThanOrEqual(1);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("held result");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
   it("does not hold at all when the ceiling is disabled (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)", async () => {
     process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
 
