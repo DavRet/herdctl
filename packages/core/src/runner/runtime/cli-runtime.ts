@@ -405,15 +405,25 @@ export class CLIRuntime implements RuntimeInterface {
       }
 
       // Claude CLI can emit duplicate finalized snapshots for the same message id.
+      // With extended thinking enabled, the CLI also emits the SAME message id
+      // across multiple transcript entries that each carry only one content
+      // block type (e.g. one entry with content:[{type:"thinking"}], followed by
+      // a second entry with the same id and content:[{type:"text"}]) instead of
+      // bundling all blocks into a single entry. Only the usage/turn accounting
+      // must be deduped by id (it's identical across these split entries) — text
+      // extraction must run on every entry, or the text-only entry's content is
+      // silently dropped and the synthetic result ends up empty (issue: CLI
+      // runtime empty result on pure-text end_turn turns).
       const messageId = assistantMeta.message?.id;
+      let isDuplicateId = false;
       if (typeof messageId === "string" && messageId.length > 0) {
         if (seenAssistantMessageIds.has(messageId)) {
-          return;
+          isDuplicateId = true;
+        } else {
+          seenAssistantMessageIds.add(messageId);
         }
-        seenAssistantMessageIds.add(messageId);
       }
 
-      numTurns++;
       const msg = message as {
         message?: {
           model?: string;
@@ -426,29 +436,34 @@ export class CLIRuntime implements RuntimeInterface {
           };
         };
       };
-      const usage = msg.message?.usage;
-      if (usage) {
-        const inputTokens = usage.input_tokens ?? 0;
-        const outputTokens = usage.output_tokens ?? 0;
-        const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
-        const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
+      if (!isDuplicateId) {
+        numTurns++;
+        const usage = msg.message?.usage;
+        if (usage) {
+          const inputTokens = usage.input_tokens ?? 0;
+          const outputTokens = usage.output_tokens ?? 0;
+          const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
+          const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
 
-        totalInputTokens += inputTokens;
-        totalOutputTokens += outputTokens;
+          totalInputTokens += inputTokens;
+          totalOutputTokens += outputTokens;
 
-        const modelId = msg.message?.model ?? "unknown";
-        const bucket = (modelUsage[modelId] ??= {
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-        });
-        bucket.inputTokens += inputTokens;
-        bucket.outputTokens += outputTokens;
-        bucket.cacheCreationInputTokens += cacheCreationInputTokens;
-        bucket.cacheReadInputTokens += cacheReadInputTokens;
+          const modelId = msg.message?.model ?? "unknown";
+          const bucket = (modelUsage[modelId] ??= {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens: 0,
+          });
+          bucket.inputTokens += inputTokens;
+          bucket.outputTokens += outputTokens;
+          bucket.cacheCreationInputTokens += cacheCreationInputTokens;
+          bucket.cacheReadInputTokens += cacheReadInputTokens;
+        }
       }
-      // Capture last text content for result fallback
+      // Capture last text content for result fallback.
+      // Runs unconditionally (even for a "duplicate" id) so a split thinking/text
+      // pair for the same message id still yields its text block.
       const content = msg.message?.content;
       if (Array.isArray(content)) {
         const textParts = content.filter((b) => b.type === "text" && b.text).map((b) => b.text!);
