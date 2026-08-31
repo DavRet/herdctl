@@ -3547,3 +3547,61 @@ describe("dirty-marking on hard close (vulpes-pack#206)", () => {
     expect(after?.session_id).toBe("clean-session");
   });
 });
+
+// =============================================================================
+// Non-interactive composition with an un-drained background task
+// (vulpes-pack#206 follow-up: adversarial 13-agent review of vulpes-v2)
+// =============================================================================
+//
+// The review noted the existing truthful-close/marker coverage only tested
+// the interactive (openSession) path — this pins the plain execute() path,
+// mirroring what SDKRuntime.execute()'s own maxHoldPromise backstop (BLOCKER
+// 1) produces when a background child never reports drained: instead of
+// hanging forever, a live background_tasks_changed followed by a synthetic
+// terminal error. JobExecutor needs no special-case code for this — the same
+// truthful-close marking that handles any other stream-level error already
+// covers it, since the plain execute() path shares this loop with openSession.
+
+describe("JobExecutor non-interactive composition with an un-drained background task (vulpes-pack#206 review)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("marks the job when the underlying runtime forcibly ends a non-interactive run over an un-drained background task", async () => {
+    const runtime = createMockRuntimeWithMessages([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1" }],
+      } as unknown as SDKMessage,
+      {
+        type: "error",
+        message: "execute() timed out after holding open 7200000ms without concluding",
+        code: "MAX_HOLD_ELAPSED",
+      } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "undrained-noninteractive-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      // `interactive` intentionally omitted — the plain execute() path.
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.summary).toContain("background work terminated before completion");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
+  });
+});

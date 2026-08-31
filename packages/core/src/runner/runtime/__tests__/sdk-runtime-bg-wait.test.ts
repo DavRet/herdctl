@@ -83,7 +83,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ResolvedAgent } from "../../../config/index.js";
 import type { SessionLifecycleSignal } from "../../../session/types.js";
 import type { RuntimeExecuteOptions } from "../interface.js";
-import { SDKRuntime } from "../sdk-runtime.js";
+import { RACE_SETTLE_MS, SDKRuntime } from "../sdk-runtime.js";
 
 /** Grab the Stop-hook callback `execute()` registered on its last `query()` call. */
 function stopCallbackFromLastQueryCall(): (input: unknown) => Promise<unknown> {
@@ -139,7 +139,10 @@ describe("SDKRuntime.execute() background-task hold (issue #458, no ceiling — 
     const stream = activeStream!;
     stream.push({ type: "result", subtype: "success" });
 
-    await drain; // no grace armed at all — resolves without any timer advance
+    // Still goes through the ordering-race settle window (RACE_SETTLE_MS) —
+    // nothing shows up, so this is effectively-immediate, same as before.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
+    await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
     expect(stream.isClosed()).toBe(true);
   });
@@ -247,6 +250,9 @@ describe("SDKRuntime.execute() background-task hold (issue #458, no ceiling — 
     await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS / 2);
     stream.push({ type: "assistant", message: { content: [] } });
     stream.push({ type: "result", subtype: "success", result: "second turn" });
+    // The fresh terminal itself goes through its own (short) ordering-race
+    // settle before release — nothing else shows up, so it resolves fast.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
     await drain;
 
     const results = seen.filter((m) => m.type === "result");
@@ -636,5 +642,149 @@ describe("SDKRuntime.execute() onLifecycleSignal consumer composition (vulpes-pa
     await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
+  });
+});
+
+// Adversarial 13-agent review of the LZS-347/#458 rewrite (vulpes-pack#206,
+// prod job-w11ho7 follow-up) found 2 blockers + 1 major before vulpes-v2
+// could deploy — these pin the three fixes.
+describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
+  it("BLOCKER 1: the maxHold backstop force-ends a run whose background task never reports drained", async () => {
+    // A crashed (or silently-dropped-event) background child must not hold
+    // the run open forever just because `liveBackgroundTasks` never sees an
+    // empty `background_tasks_changed` — sessionTimeoutMs is documented as
+    // not caller-threaded to this path, but there must still be SOME bound.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held result" } as FakeMessage);
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // The task never drains, ever — advance well past DEFAULT_SESSION_TIMEOUT_MS
+    // (2h) with nothing else arriving.
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+    await drain;
+
+    // The stale "held result" must NEVER surface as the outcome — a forced
+    // error instead, truthfully reporting the timeout.
+    expect(seen.some((m) => m.type === "result" && m.result === "held result")).toBe(false);
+    const errors = seen.filter((m) => m.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].code).toBe("MAX_HOLD_ELAPSED");
+    expect(errors[0].message).toMatch(/timed out/);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("BLOCKER 2: a reinvocation turn streaming past the reinvocation grace is not torn down", async () => {
+    // The grace only bounds the GAP until a follow-up turn announces itself
+    // — once it has, ordinary pass-through content (assistant/tool_use/
+    // tool_result) must keep cancelling it for as long as that turn is
+    // actively producing output, however long the turn itself takes.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "first turn" } as FakeMessage);
+    await flushMicrotasks();
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks(); // reinvocation grace (15s) now armed
+
+    // The re-invocation turn streams content well past the 15s grace window,
+    // one chunk at a time, each arriving before the previous grace elapses —
+    // each one must cancel and effectively reset the wait.
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS - 1000);
+      stream.push({ type: "assistant", message: { content: [`chunk ${i}`] } });
+      await flushMicrotasks();
+    }
+    // Total elapsed by now: ~4 * 14s = 56s, well past a single 15s grace —
+    // the stale first-turn result must not have been released.
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+
+    // The turn finally concludes with its own terminal.
+    stream.push({ type: "result", subtype: "success", result: "second turn" } as FakeMessage);
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("second turn");
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("MAJOR 3: a background task announced right after its own terminal is not orphaned", async () => {
+    // The SDK's ordering between a terminal turn's own result and a
+    // background task IT dispatched is unspecified — the task's
+    // `background_tasks_changed` announcement can arrive just AFTER the
+    // terminal that spawned it, not before. `liveBackgroundTasks` reads
+    // stale-empty at the exact moment the terminal is processed.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+
+    // Terminal arrives FIRST — no task has ever been reported live yet.
+    stream.push({ type: "result", subtype: "success", result: "spawned a child" } as FakeMessage);
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false); // settle window armed, not released yet
+
+    // The task's announcement lands moments later, within the settle window.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS / 2);
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "late-t1" }],
+    });
+    await flushMicrotasks();
+
+    // Must NOT have released over the fresh orphan — now holding on the
+    // (newly known live) task exactly like any other live-task case.
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // The child eventually finishes.
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("spawned a child");
+    expect(stream.isClosed()).toBe(true);
   });
 });

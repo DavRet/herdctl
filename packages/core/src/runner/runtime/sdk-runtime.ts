@@ -21,33 +21,72 @@ import { DEFAULT_REINVOCATION_GRACE_MS } from "../../session/session-reaper.js";
 import type { SessionLifecycleSignal } from "../../session/types.js";
 import { isTerminalMessage } from "../message-processor.js";
 import { toSDKOptions } from "../sdk-adapter.js";
-import type { InjectedMcpServerDef, SDKMessage } from "../types.js";
+import {
+  DEFAULT_SESSION_TIMEOUT_MS,
+  type InjectedMcpServerDef,
+  type SDKMessage,
+} from "../types.js";
 import { withClaudeConfigDir } from "./claude-config-dir.js";
 import { defaultClaudeHome } from "./cli-session-path.js";
 import type { RuntimeExecuteOptions, RuntimeInterface, RuntimeSession } from "./interface.js";
 import { MessageQueue } from "./message-queue.js";
 
 /**
- * Sentinel distinguishing "the reinvocation grace elapsed" from a real message
- * in the `Promise.race` below.
+ * Sentinel distinguishing "a grace elapsed" from a real message in the
+ * `Promise.race` below. Shared by both grace kinds `armGrace` can arm — the
+ * action on elapse (release whatever terminal is held) is identical either
+ * way:
  *
- * There used to be a fixed ceiling here (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`,
- * default 10 min) that raced the WHOLE hold, live tasks or not — removed after
- * job-2026-08-31-okhjlg: it killed a legitimate >10min Figma build mid-work and
- * the job still reported "success" with the stale pre-kill result (see
- * job-executor.ts's `endedWithLiveBackgroundTasks` for the truthful-close half
- * of that fix). While tasks are live there is now no time limit at all — the
- * SessionReaper is the policy for "how long does live background work get to
- * run", not this loop. The only timer left is this grace, and it only ever
- * arms once background_tasks_changed reports the set drained to empty: a
- * one-shot query() gets no re-invocation turn of its own the way a persistent
- * openSession() session does, so this gives a follow-up turn (the SDK handing
- * back the child's result) `DEFAULT_REINVOCATION_GRACE_MS` (same 15s window
- * `SessionReaper` gives a re-invocation before reaping, session-reaper.ts) to
- * show up before releasing the held terminal. Any new message arriving during
- * the grace cancels it — that IS the follow-up turn announcing itself.
+ * - The **reinvocation grace** (`DEFAULT_REINVOCATION_GRACE_MS`, ~15s): once
+ *   `background_tasks_changed` reports the set drained to empty, a one-shot
+ *   query() gets no re-invocation turn of its own the way a persistent
+ *   openSession() session does — this gives a follow-up turn (the SDK
+ *   handing back the child's result) the same window `SessionReaper` gives a
+ *   re-invocation before reaping (session-reaper.ts) to show up before
+ *   releasing the held terminal.
+ * - The **ordering-race settle** (`RACE_SETTLE_MS`, far shorter): a
+ *   background task dispatched IN the terminal turn itself can lose the wire
+ *   race against that turn's own terminal message — the SDK's ordering
+ *   between the two is unspecified (vulpes-pack#206 follow-up, prod). A
+ *   fresh terminal reporting zero known live tasks gets this brief settle
+ *   before being trusted as a genuine clean end, so the task's own
+ *   just-behind announcement has a chance to land and flip
+ *   `liveBackgroundTasks` non-empty first.
+ *
+ * Either grace is cancelled by ANY subsequent message (see the top of the
+ * loop below) — SessionReaper's own "activity cancels the pending reap"
+ * contract: ordinary pass-through content (assistant/tool_use/tool_result)
+ * from an actual re-invocation must not let its own grace time out from
+ * under it just because that content isn't itself a fresh terminal or a
+ * background_tasks_changed report. Cancelling does not mean "done" — it
+ * means "keep holding unconditionally" until a fresh terminal supersedes the
+ * stale one, or a later drain re-arms a fresh grace.
+ *
+ * There used to be a single fixed ceiling here
+ * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, default 10 min) that raced the
+ * WHOLE hold, live tasks or not — removed after job-2026-08-31-okhjlg: it
+ * killed a legitimate >10min Figma build mid-work and the job still reported
+ * "success" with the stale pre-kill result (see job-executor.ts's
+ * `endedWithLiveBackgroundTasks` for the truthful-close half of that fix).
+ * While tasks are live there is still no time limit tied to THIS mechanism —
+ * only `maxHoldPromise` below (a much longer, absolute last-resort backstop)
+ * bounds that case.
  */
 const REINVOCATION_GRACE_ELAPSED = Symbol("reinvocation-grace-elapsed");
+
+/**
+ * Short settle window for the terminal-vs-background_tasks_changed ordering
+ * race (see {@link REINVOCATION_GRACE_ELAPSED} above). Deliberately far
+ * shorter than the reinvocation grace — this isn't waiting for a turn to
+ * happen, just for an already-in-flight event to land.
+ */
+export const RACE_SETTLE_MS = 250;
+
+/**
+ * Sentinel for the absolute last-resort backstop on the whole hold — see
+ * `maxHoldPromise` in {@link SDKRuntime.execute}.
+ */
+const MAX_HOLD_ELAPSED = Symbol("max-hold-elapsed");
 
 /**
  * Build a streaming-input user message from plain text.
@@ -304,17 +343,15 @@ export class SDKRuntime implements RuntimeInterface {
     const iterator = messages[Symbol.asyncIterator]();
 
     let pendingTerminal: SDKMessage | undefined;
-    // Armed only once tasks drain to empty (see `justDrained` above) — not a
-    // fixed ceiling on the whole hold. Re-armed fresh each time a genuine new
-    // drain transition earns one; any message in between cancels it.
+    // Armed either on a drain-to-empty (the long reinvocation grace) or on a
+    // fresh terminal with zero known live tasks (the short ordering-race
+    // settle) — see REINVOCATION_GRACE_ELAPSED above. Re-armed fresh each
+    // time; any message in between cancels it (see the top of the loop).
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     let gracePromise: Promise<typeof REINVOCATION_GRACE_ELAPSED> | undefined;
-    const armGrace = (): void => {
+    const armGrace = (ms: number): void => {
       gracePromise = new Promise((resolve) => {
-        graceTimer = setTimeout(
-          () => resolve(REINVOCATION_GRACE_ELAPSED),
-          DEFAULT_REINVOCATION_GRACE_MS,
-        );
+        graceTimer = setTimeout(() => resolve(REINVOCATION_GRACE_ELAPSED), ms);
         graceTimer.unref?.();
       });
     };
@@ -326,14 +363,62 @@ export class SDKRuntime implements RuntimeInterface {
       gracePromise = undefined;
     };
 
+    // Absolute last-resort backstop on the WHOLE hold (armed once, for the
+    // life of this call — mirrors JobExecutor's own `drainTimer` on the
+    // openSession path, same default). Not a ceiling on the "still live"
+    // case specifically (that's still unconditional, per REINVOCATION_GRACE_
+    // ELAPSED above) — a bound on the entire run, for the case a background
+    // child crashes without ever reporting a final `background_tasks_changed`
+    // (or the event is silently dropped): without this the hold above would
+    // never fire on its own, and the job would drain forever. On firing, the
+    // held terminal is DISCARDED in favor of a synthetic error (see
+    // `maxHoldError` below) — this must never surface as a silent "success"
+    // on a stale result, matching JobExecutor's truthful-close marker
+    // (`endedWithLiveBackgroundTasks`), which reads this the same way it
+    // already reads any other stream-level error.
+    let maxHoldTimer: ReturnType<typeof setTimeout> | undefined;
+    const maxHoldPromise = new Promise<typeof MAX_HOLD_ELAPSED>((resolve) => {
+      maxHoldTimer = setTimeout(() => resolve(MAX_HOLD_ELAPSED), DEFAULT_SESSION_TIMEOUT_MS);
+      maxHoldTimer.unref?.();
+    });
+    const maxHoldError = (): SDKMessage =>
+      ({
+        type: "error",
+        // "timed out" is deliberate wording, not just description — job-executor's
+        // `classifyError` substring-matches it to exit_reason "timeout", the same
+        // classification the openSession path's own sessionTimeoutMs backstop gets.
+        message: `execute() timed out after holding open ${DEFAULT_SESSION_TIMEOUT_MS}ms without concluding (background work never reported drained) — forcibly ending`,
+        code: "MAX_HOLD_ELAPSED",
+      }) as unknown as SDKMessage;
+
     try {
       while (true) {
         const nextResult = gracePromise
-          ? await Promise.race([iterator.next(), gracePromise])
-          : await iterator.next();
+          ? await Promise.race([iterator.next(), gracePromise, maxHoldPromise])
+          : await Promise.race([iterator.next(), maxHoldPromise]);
 
-        if (nextResult === REINVOCATION_GRACE_ELAPSED) break; // no follow-up turn arrived; yield the held terminal below
+        if (nextResult === MAX_HOLD_ELAPSED) {
+          // Discard whatever stale terminal was held — this is a forced,
+          // truthful-close ending, not the run's real result.
+          pendingTerminal = maxHoldError();
+          break;
+        }
+        if (nextResult === REINVOCATION_GRACE_ELAPSED) break; // nothing new arrived; yield the held terminal below
         if (nextResult.done) break;
+
+        // Any message is activity — cancel a pending grace outright, whether
+        // it's the long reinvocation grace or the short ordering-race settle
+        // (SessionReaper's own "activity cancels the pending reap" contract,
+        // session-reaper.ts). This does NOT mean the run is done: it means
+        // "keep holding unconditionally" until a fresh terminal supersedes
+        // the stale one, or the decision below re-arms a fresh grace for the
+        // new state. Re-arming a plain pass-through message onto an ALREADY
+        // reinvoked turn's own content — instead of letting it silently
+        // outlive a grace it never touched — is exactly what closes the case
+        // where a genuine re-invocation streams for longer than the grace
+        // window: it now just keeps resetting the timer as long as content
+        // keeps arriving, same as SessionReaper's `activity` signal.
+        clearGrace();
 
         const message = nextResult.value;
         // Read synchronously off the raw message, ahead of (and independent
@@ -370,34 +455,30 @@ export class SDKRuntime implements RuntimeInterface {
 
         if (pendingTerminal) {
           if (liveBackgroundTasks.length > 0) {
-            // Still (or newly) live — cancel any armed grace, hold unconditionally.
-            clearGrace();
+            // Still (or newly) live — nothing to arm; already cleared above.
           } else if (isFreshTerminal) {
-            // A fresh terminal with nothing left live IS the resolution a
-            // grace (if any was ticking) exists to wait for — done now,
-            // whatever time was left on it. Also the "never had background
-            // work" fast path: nothing was ever armed, so this just yields
-            // immediately, same as before #458.
-            clearGrace();
-            break;
+            // Ordering race: a background task dispatched IN this terminal
+            // turn can lose the wire race against the turn's own terminal
+            // (SDK ordering unspecified, vulpes-pack#206 follow-up). Settle
+            // briefly rather than trusting "zero known live tasks" outright
+            // — if the task's announcement lands within the window,
+            // `liveBackgroundTasks` flips non-empty and the next iteration
+            // holds normally instead of releasing over a fresh orphan. The
+            // "never had background work" fast path rides the same branch:
+            // nothing shows up in 250ms, same effectively-immediate release
+            // as before #458.
+            armGrace(RACE_SETTLE_MS);
           } else if (justDrained) {
             // A genuine drain-to-empty transition, not itself a terminal:
-            // give a follow-up turn a short grace before giving up on it.
-            // A PLAIN pass-through message must never reach this branch and
-            // must never cancel an already-armed grace either — only a fresh
-            // terminal (above) or a genuine new drain does; getting that
-            // wrong previously released the stale held terminal the instant
-            // any follow-up content arrived, instead of waiting for ITS
-            // terminal.
+            // give a follow-up turn a real chance to show up before giving
+            // up on it.
             justDrained = false;
-            armGrace();
-          } else if (!gracePromise) {
-            // Nothing live, no fresh transition, and no grace already
-            // ticking from an earlier one: genuinely nothing left to wait for.
-            break;
+            armGrace(DEFAULT_REINVOCATION_GRACE_MS);
           }
-          // else: a grace armed by an earlier drain is still ticking and
-          // this message didn't change anything — let it run its course.
+          // else: nothing live, no fresh transition, no grace to arm — keep
+          // holding unconditionally. A fresh terminal or a later drain
+          // resolves it; `maxHoldPromise` above is the ultimate backstop if
+          // neither ever comes.
         }
       }
 
@@ -409,6 +490,7 @@ export class SDKRuntime implements RuntimeInterface {
       if (pendingTerminal) yield pendingTerminal;
     } finally {
       clearGrace();
+      if (maxHoldTimer) clearTimeout(maxHoldTimer);
       input.end();
       try {
         await q.return(undefined);

@@ -94,7 +94,14 @@ export interface RunnerOptions {
    * terminal `result` never arrives would drain forever: the job stays
    * `running`, its concurrency slot is never released and its `claude` process
    * is never reaped. On expiry the session is closed and the run is recorded as
-   * failed. Ignored on the one-shot `execute()` path, which ends by itself.
+   * failed.
+   *
+   * NOT threaded to the one-shot `execute()` path as a caller-configurable
+   * value — that path enforces its own absolute last-resort backstop, fixed
+   * at {@link DEFAULT_SESSION_TIMEOUT_MS} regardless of this option, so a
+   * background child that crashes without ever reporting a final
+   * `background_tasks_changed` (or whose event is dropped) can't hold the
+   * run open forever either (see `SDKRuntime.execute()`'s `maxHoldPromise`).
    */
   sessionTimeoutMs?: number;
   /**
