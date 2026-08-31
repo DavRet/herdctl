@@ -139,9 +139,11 @@ describe("SDKRuntime.execute() background-task hold (issue #458, no ceiling — 
     const stream = activeStream!;
     stream.push({ type: "result", subtype: "success" });
 
-    // Still goes through the ordering-race settle window (RACE_SETTLE_MS) —
-    // nothing shows up, so this is effectively-immediate, same as before.
-    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
+    // No settle window at all (MAJOR C, verify round 2): this run never
+    // touched background work, so there's no race to settle for — releases
+    // on pure microtask flushing, no timer advance needed. See the dedicated
+    // "no timer armed at all" test below for a stronger assertion of this.
+    await flushMicrotasks();
     await drain;
     expect(seen.filter((m) => m.type === "result")).toHaveLength(1);
     expect(stream.isClosed()).toBe(true);
@@ -738,12 +740,20 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
     expect(stream.isClosed()).toBe(true);
   });
 
-  it("MAJOR 3: a background task announced right after its own terminal is not orphaned", async () => {
+  it("MAJOR 3: a background task announced right after its own terminal is not orphaned (run has touched background work before)", async () => {
     // The SDK's ordering between a terminal turn's own result and a
     // background task IT dispatched is unspecified — the task's
     // `background_tasks_changed` announcement can arrive just AFTER the
     // terminal that spawned it, not before. `liveBackgroundTasks` reads
     // stale-empty at the exact moment the terminal is processed.
+    //
+    // #206 review MAJOR C narrowed the settle window to runs that have
+    // ALREADY reported background activity at least once (`sawBackgroundActivity`)
+    // — a run's very first-ever background dispatch racing its own terminal
+    // is a known, accepted gap of that trade-off (see the test below), not
+    // covered here. This pins the scope MAJOR C actually leaves intact: a
+    // SECOND task dispatched by a re-invocation turn, racing that turn's own
+    // terminal, in a run that already touched background work earlier.
     const runtime = new SDKRuntime();
     const seen: FakeMessage[] = [];
     const drain = (async () => {
@@ -755,28 +765,43 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
     await flushMicrotasks();
     const stream = activeStream!;
 
-    // Terminal arrives FIRST — no task has ever been reported live yet.
-    stream.push({ type: "result", subtype: "success", result: "spawned a child" } as FakeMessage);
+    // First background task — establishes sawBackgroundActivity.
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "first turn" } as FakeMessage);
+    await flushMicrotasks();
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks(); // t1 drains — reinvocation grace armed
+
+    // The re-invocation turn arrives and, in the SAME turn, dispatches a
+    // SECOND task whose announcement loses the wire race against this
+    // turn's own terminal.
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS / 2);
+    stream.push({ type: "result", subtype: "success", result: "second turn" } as FakeMessage);
     await flushMicrotasks();
     expect(seen.some((m) => m.type === "result")).toBe(false); // settle window armed, not released yet
 
-    // The task's announcement lands moments later, within the settle window.
+    // t2's announcement lands moments later, within the settle window.
     await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS / 2);
     stream.push({
       type: "system",
       subtype: "background_tasks_changed",
-      tasks: [{ task_id: "late-t1" }],
+      tasks: [{ task_id: "late-t2" }],
     });
     await flushMicrotasks();
 
-    // Must NOT have released over the fresh orphan — now holding on the
-    // (newly known live) task exactly like any other live-task case.
+    // Must NOT have released "second turn" over the fresh orphan — now
+    // holding on the (newly known live) task exactly like any other
+    // live-task case.
     expect(seen.some((m) => m.type === "result")).toBe(false);
     expect(stream.isClosed()).toBe(false);
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(seen.some((m) => m.type === "result")).toBe(false);
 
-    // The child eventually finishes.
+    // t2 eventually finishes.
     stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
     await flushMicrotasks();
     await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
@@ -784,7 +809,160 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
 
     const results = seen.filter((m) => m.type === "result");
     expect(results).toHaveLength(1);
-    expect(results[0].result).toBe("spawned a child");
+    expect(results[0].result).toBe("second turn"); // not the stale "first turn"
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("MAJOR C trade-off: a run's very first background dispatch racing its own (first) terminal is not caught — documented gap, not a regression to fix here", async () => {
+    // Without any PRIOR background_tasks_changed, sawBackgroundActivity is
+    // false, so the settle window never arms for this exact terminal — the
+    // v2 immediate-release fast path runs instead, same as a run with no
+    // background work at all. This is the accepted cost of MAJOR C (an
+    // unconditional settle tail on every clean terminal, including the
+    // overwhelming majority of runs that never touch background work, was
+    // itself a review finding) — flagged here so it's a conscious, visible
+    // trade-off rather than a silent regression of the MAJOR 3 fix above.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+
+    stream.push({ type: "result", subtype: "success", result: "spawned a child" } as FakeMessage);
+    await drain; // released immediately — no settle window on a first-ever terminal
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
+  });
+});
+
+// Verify round on the fixes above (vulpes-pack#206) found 4 confirmed majors
+// + 2 minors, 0 refuted — every finding survived adversarial check. Fix
+// round 2, all in sdk-runtime.ts.
+describe("SDKRuntime.execute() verify round 2 (4 majors + 2 minors)", () => {
+  it("MAJOR A: an actively streaming run survives past the maxHold window — inactivity bound, not a call bound", async () => {
+    // The old (round-1) maxHoldPromise was armed once before the loop and
+    // never reset — a healthy, actively-streaming run got killed at exactly
+    // 2h regardless of activity. It must now only measure a stretch of
+    // SILENCE while holding, reset by every message.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held" } as FakeMessage);
+    await flushMicrotasks();
+
+    // Periodic activity (the task is still reported live) every 50 minutes,
+    // for a total well past the 2h DEFAULT_SESSION_TIMEOUT_MS bound. Each
+    // ping arrives comfortably inside the PREVIOUS ping's own maxHold
+    // window, so the inactivity clock never has a chance to elapse.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(50 * 60_000);
+      stream.push({
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "t1" }],
+      });
+      await flushMicrotasks();
+    }
+    // Total elapsed: ~150 minutes (2.5h), past the 2h bound — still alive.
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+    expect(stream.isClosed()).toBe(false);
+
+    // The task finally finishes.
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("held");
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("MAJOR C: a job that never touches background work releases with no added tail — no timer armed at all", async () => {
+    // Stronger than "fast": if ANY timer (settle, reinvocation, or maxHold)
+    // were armed here, `drain` would never resolve without an explicit
+    // `vi.advanceTimersByTimeAsync` call, since fake timers never
+    // auto-advance — this test deliberately makes none.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({ type: "result", subtype: "success", result: "no bg work" } as FakeMessage);
+
+    await drain; // no timer advance at all — hangs (and times out) if anything got armed
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("MAJOR D: a redundant message during a drain does not strand the hold — the grace re-arms and the job still completes", async () => {
+    // A duplicate/irrelevant message (a repeated 0-task report, not a new
+    // transition) arriving while a reinvocation grace is ticking must not
+    // leave the hold unarmed until maxHoldPromise's multi-hour backstop —
+    // it must re-arm so a genuinely complete run still finishes promptly.
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "t1" }],
+    });
+    stream.push({ type: "result", subtype: "success", result: "held result" } as FakeMessage);
+    await flushMicrotasks();
+
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks(); // genuine drain — reinvocation grace (15s) armed
+
+    // A redundant, already-0 report arrives mid-grace — not a new
+    // transition, and not itself a terminal.
+    await vi.advanceTimersByTimeAsync(5000);
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await flushMicrotasks();
+
+    // Must still resolve on the SHORT reinvocation grace, not maxHoldPromise's
+    // 2h backstop — advancing only the REMAINDER of a (re-armed) 15s window
+    // is enough.
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("held result");
     expect(stream.isClosed()).toBe(true);
   });
 });

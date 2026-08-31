@@ -75,12 +75,26 @@ import { MessageQueue } from "./message-queue.js";
 const REINVOCATION_GRACE_ELAPSED = Symbol("reinvocation-grace-elapsed");
 
 /**
- * Short settle window for the terminal-vs-background_tasks_changed ordering
- * race (see {@link REINVOCATION_GRACE_ELAPSED} above). Deliberately far
- * shorter than the reinvocation grace — this isn't waiting for a turn to
+ * Default settle window for the terminal-vs-background_tasks_changed
+ * ordering race (see {@link REINVOCATION_GRACE_ELAPSED} above). Deliberately
+ * far shorter than the reinvocation grace — this isn't waiting for a turn to
  * happen, just for an already-in-flight event to land.
+ *
+ * Probabilistic, not a guarantee (#206 review MINOR 1): 250ms comfortably
+ * covers same-process/same-tick delivery jitter, but subprocess spawn or IPC
+ * latency on a loaded host could exceed it, in which case the race is still
+ * lost and the task is (truthfully, per MAJOR B below) orphaned rather than
+ * silently mis-held. `HERDCTL_RACE_SETTLE_MS` overrides it for hosts that
+ * need more headroom, without redesigning the mechanism.
  */
 export const RACE_SETTLE_MS = 250;
+
+function raceSettleMs(): number {
+  const raw = process.env.HERDCTL_RACE_SETTLE_MS;
+  if (raw === undefined || raw === "") return RACE_SETTLE_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : RACE_SETTLE_MS;
+}
 
 /**
  * Sentinel for the absolute last-resort backstop on the whole hold — see
@@ -271,7 +285,16 @@ export class SDKRuntime implements RuntimeInterface {
     // false) the moment the grace it earns gets armed, so a later terminal
     // that's already draining-with-nothing-new doesn't re-arm a second grace.
     let justDrained = false;
+    // Set once, the first time this run EVER reports a background_tasks_changed
+    // (live or draining-to-empty) — distinct from `liveBackgroundTasks.length`,
+    // which flips back to 0. Gates the ordering-race settle window (#206
+    // review MAJOR C): the overwhelming majority of runs never touch a
+    // background task at all, and RACE_SETTLE_MS shouldn't tax every one of
+    // them with a tail on their clean terminal just to hedge against a race
+    // that, by definition, can't happen for a run with no background activity.
+    let sawBackgroundActivity = false;
     const noteBackgroundTasks = (tasks: BackgroundTaskSummary[]) => {
+      sawBackgroundActivity = true;
       if (liveBackgroundTasks.length > 0 && tasks.length === 0) {
         justDrained = true;
       }
@@ -363,39 +386,66 @@ export class SDKRuntime implements RuntimeInterface {
       gracePromise = undefined;
     };
 
-    // Absolute last-resort backstop on the WHOLE hold (armed once, for the
-    // life of this call — mirrors JobExecutor's own `drainTimer` on the
-    // openSession path, same default). Not a ceiling on the "still live"
-    // case specifically (that's still unconditional, per REINVOCATION_GRACE_
-    // ELAPSED above) — a bound on the entire run, for the case a background
-    // child crashes without ever reporting a final `background_tasks_changed`
-    // (or the event is silently dropped): without this the hold above would
-    // never fire on its own, and the job would drain forever. On firing, the
-    // held terminal is DISCARDED in favor of a synthetic error (see
-    // `maxHoldError` below) — this must never surface as a silent "success"
-    // on a stale result, matching JobExecutor's truthful-close marker
+    // Absolute last-resort INACTIVITY backstop while holding a terminal open
+    // (mirrors JobExecutor's own `drainTimer` on the openSession path, same
+    // default duration). #206 review MAJOR A: this must NOT be a bound on the
+    // whole call — armed once before the loop and never reset, it killed a
+    // healthy, actively-streaming run at exactly 2h regardless of activity,
+    // the same "kill healthy work" class the original ceiling removal (#458)
+    // fixed, just relocated. So instead it's armed/cleared on the exact same
+    // schedule as `gracePromise` (cleared on any message below, re-armed at
+    // the end of the decision block below whenever still holding) — it only
+    // ever measures a stretch of ABSOLUTE SILENCE while a terminal is held,
+    // for the case a background child crashes without ever reporting a final
+    // `background_tasks_changed` (or the event is silently dropped): without
+    // this, that specific silence would hold forever, since nothing else
+    // would ever arm a release. On firing, the held terminal is DISCARDED in
+    // favor of a synthetic error (`maxHoldError` below, MAJOR B: worded from
+    // the actual `liveBackgroundTasks` state at the moment, not a hardcoded
+    // claim) — this must never surface as a silent "success" on a stale
+    // result, matching JobExecutor's truthful-close marker
     // (`endedWithLiveBackgroundTasks`), which reads this the same way it
     // already reads any other stream-level error.
     let maxHoldTimer: ReturnType<typeof setTimeout> | undefined;
-    const maxHoldPromise = new Promise<typeof MAX_HOLD_ELAPSED>((resolve) => {
-      maxHoldTimer = setTimeout(() => resolve(MAX_HOLD_ELAPSED), DEFAULT_SESSION_TIMEOUT_MS);
-      maxHoldTimer.unref?.();
-    });
-    const maxHoldError = (): SDKMessage =>
-      ({
+    let maxHoldPromise: Promise<typeof MAX_HOLD_ELAPSED> | undefined;
+    const armMaxHold = (): void => {
+      maxHoldPromise = new Promise((resolve) => {
+        maxHoldTimer = setTimeout(() => resolve(MAX_HOLD_ELAPSED), DEFAULT_SESSION_TIMEOUT_MS);
+        maxHoldTimer.unref?.();
+      });
+    };
+    const clearMaxHold = (): void => {
+      if (maxHoldTimer) {
+        clearTimeout(maxHoldTimer);
+        maxHoldTimer = undefined;
+      }
+      maxHoldPromise = undefined;
+    };
+    const maxHoldError = (): SDKMessage => {
+      const state =
+        liveBackgroundTasks.length > 0
+          ? `${liveBackgroundTasks.length} background task(s) still reported live`
+          : "background work status unresolved at the time of the hold";
+      return {
         type: "error",
         // "timed out" is deliberate wording, not just description — job-executor's
         // `classifyError` substring-matches it to exit_reason "timeout", the same
         // classification the openSession path's own sessionTimeoutMs backstop gets.
-        message: `execute() timed out after holding open ${DEFAULT_SESSION_TIMEOUT_MS}ms without concluding (background work never reported drained) — forcibly ending`,
+        message: `execute() timed out after ${DEFAULT_SESSION_TIMEOUT_MS}ms of inactivity while holding (${state}) — forcibly ending`,
         code: "MAX_HOLD_ELAPSED",
-      }) as unknown as SDKMessage;
+      } as unknown as SDKMessage;
+    };
 
     try {
       while (true) {
-        const nextResult = gracePromise
-          ? await Promise.race([iterator.next(), gracePromise, maxHoldPromise])
-          : await Promise.race([iterator.next(), maxHoldPromise]);
+        const nextResult =
+          gracePromise && maxHoldPromise
+            ? await Promise.race([iterator.next(), gracePromise, maxHoldPromise])
+            : gracePromise
+              ? await Promise.race([iterator.next(), gracePromise])
+              : maxHoldPromise
+                ? await Promise.race([iterator.next(), maxHoldPromise])
+                : await iterator.next();
 
         if (nextResult === MAX_HOLD_ELAPSED) {
           // Discard whatever stale terminal was held — this is a forced,
@@ -406,29 +456,37 @@ export class SDKRuntime implements RuntimeInterface {
         if (nextResult === REINVOCATION_GRACE_ELAPSED) break; // nothing new arrived; yield the held terminal below
         if (nextResult.done) break;
 
-        // Any message is activity — cancel a pending grace outright, whether
-        // it's the long reinvocation grace or the short ordering-race settle
-        // (SessionReaper's own "activity cancels the pending reap" contract,
-        // session-reaper.ts). This does NOT mean the run is done: it means
-        // "keep holding unconditionally" until a fresh terminal supersedes
-        // the stale one, or the decision below re-arms a fresh grace for the
-        // new state. Re-arming a plain pass-through message onto an ALREADY
-        // reinvoked turn's own content — instead of letting it silently
-        // outlive a grace it never touched — is exactly what closes the case
-        // where a genuine re-invocation streams for longer than the grace
-        // window: it now just keeps resetting the timer as long as content
-        // keeps arriving, same as SessionReaper's `activity` signal.
+        // Any message is activity — cancel a pending grace (and the maxHold
+        // inactivity clock) outright, whether it's the long reinvocation
+        // grace or the short ordering-race settle (SessionReaper's own
+        // "activity cancels the pending reap" contract, session-reaper.ts).
+        // This does NOT mean the run is done: it means "keep holding
+        // unconditionally" until a fresh terminal supersedes the stale one,
+        // or the decision below re-arms a fresh grace for the new state.
+        // Re-arming a plain pass-through message onto an ALREADY reinvoked
+        // turn's own content — instead of letting it silently outlive a
+        // grace it never touched — is exactly what closes the case where a
+        // genuine re-invocation streams for longer than the grace window: it
+        // now just keeps resetting the timer as long as content keeps
+        // arriving, same as SessionReaper's `activity` signal.
         clearGrace();
+        clearMaxHold();
 
         const message = nextResult.value;
-        // Read synchronously off the raw message, ahead of (and independent
-        // from) tapLifecycleStream's own deferred `sink` call for the same
-        // message — see the comment on `liveBackgroundTasks` above. That sink
-        // is also how an authoritative turn_end Stop-hook signal updates this
-        // state: fully out of band from THIS loop's `iterator.next()`, so the
-        // decision below re-checks on every message (not just ones that
-        // themselves report a task count) the same way the pre-#458 ceiling
-        // logic did — the next message, whatever it is, is what surfaces a
+        // Read synchronously off the raw message — NOT "ahead of"
+        // tapLifecycleStream's own deferred `sink` call for the same message,
+        // despite an earlier version of this comment claiming so (#206
+        // review MINOR 2): both this check and the sink derive from the SAME
+        // `for await` pull inside `tapLifecycleStream`, so there's no
+        // meaningful ordering between them to be "ahead of" — this read is
+        // just a second, independent path to the same information. What
+        // actually matters is that the Stop hook's authoritative turn_end
+        // snapshot updates this state fully OUT OF BAND from this loop's
+        // `iterator.next()` (the hook fires from the SDK's own internal
+        // processing, not gated on this loop pulling anything) — so the
+        // decision below re-checks on every message, not just ones that
+        // themselves report a task count, the same way the pre-#458 ceiling
+        // logic did: the next message, whatever it is, is what surfaces a
         // signal the hook delivered in between.
         if (
           message &&
@@ -456,29 +514,44 @@ export class SDKRuntime implements RuntimeInterface {
         if (pendingTerminal) {
           if (liveBackgroundTasks.length > 0) {
             // Still (or newly) live — nothing to arm; already cleared above.
-          } else if (isFreshTerminal) {
+          } else if (isFreshTerminal && sawBackgroundActivity) {
             // Ordering race: a background task dispatched IN this terminal
             // turn can lose the wire race against the turn's own terminal
             // (SDK ordering unspecified, vulpes-pack#206 follow-up). Settle
             // briefly rather than trusting "zero known live tasks" outright
             // — if the task's announcement lands within the window,
             // `liveBackgroundTasks` flips non-empty and the next iteration
-            // holds normally instead of releasing over a fresh orphan. The
-            // "never had background work" fast path rides the same branch:
-            // nothing shows up in 250ms, same effectively-immediate release
-            // as before #458.
-            armGrace(RACE_SETTLE_MS);
+            // holds normally instead of releasing over a fresh orphan.
+            // Gated on `sawBackgroundActivity` (MAJOR C): a run that has
+            // never touched a background task at all has no race to settle
+            // for, and shouldn't pay this tail on every clean terminal.
+            armGrace(raceSettleMs());
+          } else if (isFreshTerminal) {
+            // Never had background work: nothing to wait for — the v2
+            // immediate release, no tail at all.
+            clearGrace();
+            clearMaxHold();
+            break;
           } else if (justDrained) {
             // A genuine drain-to-empty transition, not itself a terminal:
             // give a follow-up turn a real chance to show up before giving
             // up on it.
             justDrained = false;
             armGrace(DEFAULT_REINVOCATION_GRACE_MS);
+          } else {
+            // Nothing live, no fresh transition: a redundant or unrelated
+            // message (a duplicate 0-task report, stray content) arrived
+            // while we were ALREADY draining under a grace that `clearGrace()`
+            // above just cancelled. Re-arm it (#206 review MAJOR D) — leaving
+            // this unarmed would strand an otherwise-COMPLETE run on
+            // `maxHoldPromise`'s multi-hour backstop and report a false
+            // failure on what should have been a clean, on-time success.
+            armGrace(sawBackgroundActivity ? DEFAULT_REINVOCATION_GRACE_MS : raceSettleMs());
           }
-          // else: nothing live, no fresh transition, no grace to arm — keep
-          // holding unconditionally. A fresh terminal or a later drain
-          // resolves it; `maxHoldPromise` above is the ultimate backstop if
-          // neither ever comes.
+          // Reached only when none of the branches above broke out of the
+          // loop — still holding past this message. Keep the inactivity
+          // backstop engaged for whatever comes next, or doesn't.
+          armMaxHold();
         }
       }
 
