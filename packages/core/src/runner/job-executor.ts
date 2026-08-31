@@ -519,6 +519,17 @@ export class JobExecutor {
       const armInjectionGrace = (): void => {
         clearGrace();
         graceTimer = setTimeout(() => {
+          // A live background task can still be running when this grace
+          // window expires (CodeRabbit finding on the vulpes-pack sibling
+          // patch, PR #181). Closing here would kill it out from under the
+          // bg-wait ceiling armed alongside it — hold instead; the ceiling
+          // (or a later real terminal) owns teardown from here.
+          if (liveBackgroundTasks.length > 0) {
+            this.logger.warn(
+              `Job ${job.id}: injection grace expired but a background task is still live — holding for bg-wait ceiling`,
+            );
+            return;
+          }
           graceClosed = true;
           acceptingInput = false;
           this.logger.warn(
@@ -805,6 +816,26 @@ export class JobExecutor {
               lastError = undefined;
             }
 
+            // Arm the bg-wait ceiling BEFORE considering pendingInjected —
+            // CodeRabbit finding on the vulpes-pack sibling patch, PR #181: a
+            // terminal with BOTH pendingInjected>0 AND a live background task
+            // previously took the pendingInjected branch only, leaving the
+            // ceiling unarmed; if no follow-up turn came, armInjectionGrace's
+            // timeout closed the session anyway and killed the live child.
+            // Arm-once here (bgWaitCeilingArmed guards it) guarantees a
+            // deadline regardless of which branch runs next.
+            if (liveBackgroundTasks.length > 0 && bgWaitCeilingMs() > 0 && !bgWaitCeilingArmed) {
+              bgWaitCeilingArmed = true;
+              const ceiling = bgWaitCeilingMs();
+              bgWaitTimer = setTimeout(() => {
+                this.logger.warn(
+                  `Job ${job.id}: background task still running after ${ceiling}ms ceiling — closing session with the last terminal result`,
+                );
+                void closeSession();
+              }, ceiling);
+              bgWaitTimer.unref?.();
+            }
+
             if (pendingInjected > 0) {
               // Injected input is still queued behind this turn. Hosts differ on
               // when they deliver a pushed streaming-input message: some fold it
@@ -832,20 +863,8 @@ export class JobExecutor {
             // wins", same as the injected-input case above). Only
             // re-evaluated here, at a fresh terminal, not on every message —
             // a `background_tasks_changed` drain to empty is not itself a
-            // terminal message. The ceiling is a single deadline armed once
-            // at the first hold, not renewed per terminal.
+            // terminal message.
             if (liveBackgroundTasks.length > 0 && bgWaitCeilingMs() > 0) {
-              if (!bgWaitCeilingArmed) {
-                bgWaitCeilingArmed = true;
-                const ceiling = bgWaitCeilingMs();
-                bgWaitTimer = setTimeout(() => {
-                  this.logger.warn(
-                    `Job ${job.id}: background task still running after ${ceiling}ms ceiling — closing session with the last terminal result`,
-                  );
-                  void closeSession();
-                }, ceiling);
-                bgWaitTimer.unref?.();
-              }
               continue;
             }
 
