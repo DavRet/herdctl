@@ -3356,3 +3356,194 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
     expect(job?.status).toBe("failed");
   });
 });
+
+// =============================================================================
+// Empty-resume retry and dirty-marking (vulpes-pack#206, job-w11ho7)
+// =============================================================================
+//
+// Resuming a session that was hard-closed while a background task was live
+// can replay a stale `task_notification` straight into an immediate empty
+// terminal result, before the injected prompt's own turn — job-executor used
+// to treat that first terminal as the whole job and report a clean "success"
+// with zero assistant turns and zero cost, silently swallowing the prompt.
+
+describe("empty-resume retry (vulpes-pack#206)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("retries once when a resumed session emits an immediate empty terminal result", async () => {
+    const sessionsDir = join(stateDir, "sessions");
+    await updateSessionInfo(sessionsDir, "zombie-agent", {
+      session_id: "zombie-session-id",
+      mode: "autonomous",
+    });
+
+    const resumes: Array<string | undefined> = [];
+    const runtime = createMockRuntime(async function* (options: { resume?: string }) {
+      resumes.push(options.resume);
+      if (options.resume) {
+        // The zombie resume: a stale task_notification replayed straight
+        // into an empty terminal — zero assistant messages, zero turns, no
+        // error at all.
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t1",
+        } as unknown as SDKMessage;
+        yield { type: "result", subtype: "success", result: "" } as SDKMessage;
+      } else {
+        // The retry, on a fresh session: a real turn.
+        yield { type: "assistant", content: "Actually did the work" };
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "Actually did the work",
+          num_turns: 1,
+        } as SDKMessage;
+      }
+    });
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "zombie-agent" }),
+      prompt: "carry on",
+      stateDir,
+      resume: "zombie-session-id",
+    });
+
+    expect(resumes).toEqual(["zombie-session-id", undefined]);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("Actually did the work");
+  });
+
+  it("fails loudly (not success) when the retry also produces zero assistant turns", async () => {
+    const sessionsDir = join(stateDir, "sessions");
+    await updateSessionInfo(sessionsDir, "double-zombie-agent", {
+      session_id: "zombie-session-id",
+      mode: "autonomous",
+    });
+
+    const resumes: Array<string | undefined> = [];
+    const runtime = createMockRuntime(async function* (options: { resume?: string }) {
+      resumes.push(options.resume);
+      // Empty every time — the fresh retry is just as much a dead end.
+      yield { type: "result", subtype: "success", result: "" } as SDKMessage;
+    });
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "double-zombie-agent" }),
+      prompt: "carry on",
+      stateDir,
+      resume: "zombie-session-id",
+    });
+
+    // Exactly one retry: resumed once, then fresh once, then gives up.
+    expect(resumes).toEqual(["zombie-session-id", undefined]);
+    expect(result.success).toBe(false);
+    expect(result.error?.message).toContain("zero assistant turns");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
+    expect(job?.exit_reason).toBe("error");
+  });
+
+  it("does not retry a fresh (non-resumed) run that legitimately produces zero turns", async () => {
+    // Not this bug's failure mode — `resumeSessionId` is unset here, so the
+    // empty-resume path must never engage at all.
+    const runtime = createMockRuntimeWithMessages([
+      { type: "result", subtype: "success", result: "" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "fresh-empty-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+    });
+
+    expect(result.success).toBe(true);
+  });
+});
+
+describe("dirty-marking on hard close (vulpes-pack#206)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("clears the session pointer when the sessionTimeoutMs backstop fires while a background task is still live", async () => {
+    const sessionsDir = join(stateDir, "sessions");
+    await updateSessionInfo(sessionsDir, "dirty-close-agent", {
+      session_id: "pre-existing-session",
+      mode: "autonomous",
+    });
+    const before = await getSessionInfo(sessionsDir, "dirty-close-agent");
+    expect(before).not.toBeNull();
+
+    const { runtime } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "held result" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "dirty-close-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      sessionTimeoutMs: 30,
+    });
+
+    expect(result.success).toBe(false);
+
+    // The next trigger must start fresh instead of resuming a zombie —
+    // the pointer this run left dirty is gone, not silently republished.
+    const after = await getSessionInfo(sessionsDir, "dirty-close-agent");
+    expect(after).toBeNull();
+  });
+
+  it("does not clear the session pointer on a clean close with no live background work", async () => {
+    const sessionsDir = join(stateDir, "sessions");
+
+    const { runtime } = createMockSessionRuntime([
+      { type: "system", subtype: "init", session_id: "clean-session" } as SDKMessage,
+      { type: "result", subtype: "success", result: "all done", num_turns: 1 } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "clean-close-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(result.success).toBe(true);
+    const after = await getSessionInfo(sessionsDir, "clean-close-agent");
+    expect(after).not.toBeNull();
+    expect(after?.session_id).toBe("clean-session");
+  });
+});
