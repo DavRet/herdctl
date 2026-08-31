@@ -3089,3 +3089,150 @@ describe("JobExecutor injected-input drain (AI-406)", () => {
     expect(job?.status).toBe("completed");
   });
 });
+
+// =============================================================================
+// Background-task hold on the interactive path (LZS-347)
+// =============================================================================
+//
+// Mirrors `SDKRuntime.execute()`'s own bg-wait fix (issue #458,
+// runtime/__tests__/sdk-runtime-bg-wait.test.ts) for the openSession()/
+// interactive path used by Jira/GitHub jobs: a `run_in_background` Agent-tool
+// child spawned mid-turn must not be abandoned just because the turn's
+// terminal result arrived while the child was still running.
+
+describe("JobExecutor background-task hold (LZS-347)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+    delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+  });
+
+  it("keeps draining past a terminal with a live background task, and the later re-invocation result wins", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "first turn" } as SDKMessage,
+      // The child reports back: an empty background_tasks_changed drain is
+      // not itself a terminal message, so the loop must not release here —
+      // it keeps consuming until the agent's own fresh terminal arrives.
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as unknown as SDKMessage,
+      { type: "assistant", content: "child finished, wrapping up" },
+      { type: "result", subtype: "success", result: "second turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "bg-hold-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+    expect(result.success).toBe(true);
+    // The job's outcome is the LAST result, not the one held open while the
+    // background task was still live.
+    expect(result.summary).toBe("second turn");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("releases immediately when no background task is ever reported", async () => {
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "only turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "no-bg-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("only turn");
+  });
+
+  it("closes with the stale terminal result once the bg-wait ceiling elapses", async () => {
+    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "40";
+
+    const warnings: string[] = [];
+    const logger = {
+      ...createMockLogger(),
+      warn: (message: string) => warnings.push(message),
+    };
+
+    // The background task is reported live and never drains — the run must
+    // not hang forever waiting for a re-invocation that never comes.
+    const { runtime, state } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "held result" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "bg-ceiling-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(state.closed).toBeGreaterThanOrEqual(1);
+    expect(warnings.some((w) => /background task still running after 40ms ceiling/.test(w))).toBe(
+      true,
+    );
+    // An expected ending, not a failure: the last (stale) result still decides.
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("held result");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("does not hold at all when the ceiling is disabled (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)", async () => {
+    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
+
+    const { runtime, state } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "first turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "bg-disabled-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+    });
+
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("first turn");
+  });
+});
