@@ -56,6 +56,30 @@ import type {
 import { DEFAULT_INJECTION_GRACE_MS, DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
 
 // =============================================================================
+// Background-task wait ceiling
+// =============================================================================
+
+/**
+ * Bounds how long the interactive terminal-message branch below will hold a
+ * clean result open while a `run_in_background` Agent-tool child is still
+ * live, before giving up and closing the session with whatever result it
+ * has. Mirrors `claude -p`'s own `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
+ * (same env var, same 10min default; `0` disables the wait). `SDKRuntime`
+ * doesn't export an equivalent helper on this branch (its own `execute()`
+ * bg-wait hold is a sibling fix, not yet present here), so this is a
+ * standalone copy rather than a shared import — keep both in sync if either
+ * changes.
+ */
+const DEFAULT_BG_WAIT_CEILING_MS = 10 * 60_000;
+
+function bgWaitCeilingMs(): number {
+  const raw = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+  if (raw === undefined || raw === "") return DEFAULT_BG_WAIT_CEILING_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BG_WAIT_CEILING_MS;
+}
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -474,6 +498,21 @@ export class JobExecutor {
         }
       };
 
+      // Tracks the `background_tasks_changed` stream signal so a live
+      // `run_in_background` child isn't abandoned when its parent turn's
+      // terminal result arrives — same signal `SDKRuntime.execute()`'s own
+      // bg-wait fix reads. See the terminal-message branch below.
+      let liveBackgroundTasks: unknown[] = [];
+      let bgWaitTimer: ReturnType<typeof setTimeout> | undefined;
+      let bgWaitCeilingArmed = false;
+
+      const clearBgWaitTimer = (): void => {
+        if (bgWaitTimer) {
+          clearTimeout(bgWaitTimer);
+          bgWaitTimer = undefined;
+        }
+      };
+
       // Bound the wait for the follow-up turn. A host that folded the injected
       // message into the turn that just ended will never produce a second
       // result, so without this the run would idle until sessionTimeoutMs.
@@ -493,6 +532,7 @@ export class JobExecutor {
       const closeSession = async (): Promise<void> => {
         acceptingInput = false;
         clearGrace();
+        clearBgWaitTimer();
         if (drainTimer) {
           clearTimeout(drainTimer);
           drainTimer = undefined;
@@ -609,6 +649,17 @@ export class JobExecutor {
           messagesReceived++;
           // The follow-up turn is producing output — stop counting down.
           clearGrace();
+
+          // Track live background tasks off the raw message (REPLACE
+          // semantics per the SDK's payload) so the terminal-message branch
+          // below knows whether a `run_in_background` child is still running.
+          if (
+            sdkMessage &&
+            (sdkMessage as { type?: string }).type === "system" &&
+            (sdkMessage as { subtype?: string }).subtype === "background_tasks_changed"
+          ) {
+            liveBackgroundTasks = (sdkMessage as { tasks?: unknown[] }).tasks ?? [];
+          }
 
           // Process the message safely (handles malformed responses)
           let processed: ProcessedMessage | undefined;
@@ -773,7 +824,33 @@ export class JobExecutor {
               continue;
             }
 
-            // Nothing pending: this really is the end.
+            // A live background task (tracked above) means this terminal
+            // result is not really the end — the SDK will re-invoke the
+            // model once the child reports back, producing a fresh terminal
+            // that must win over this stale one (already guaranteed: summary/
+            // runUsage/lastError above are recomputed per result, "later
+            // wins", same as the injected-input case above). Only
+            // re-evaluated here, at a fresh terminal, not on every message —
+            // a `background_tasks_changed` drain to empty is not itself a
+            // terminal message. The ceiling is a single deadline armed once
+            // at the first hold, not renewed per terminal.
+            if (liveBackgroundTasks.length > 0 && bgWaitCeilingMs() > 0) {
+              if (!bgWaitCeilingArmed) {
+                bgWaitCeilingArmed = true;
+                const ceiling = bgWaitCeilingMs();
+                bgWaitTimer = setTimeout(() => {
+                  this.logger.warn(
+                    `Job ${job.id}: background task still running after ${ceiling}ms ceiling — closing session with the last terminal result`,
+                  );
+                  void closeSession();
+                }, ceiling);
+                bgWaitTimer.unref?.();
+              }
+              continue;
+            }
+
+            // Nothing pending, no live background tasks: this really is the end.
+            clearBgWaitTimer();
             acceptingInput = false;
             break;
           }
