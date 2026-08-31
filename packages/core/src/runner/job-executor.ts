@@ -56,30 +56,6 @@ import type {
 import { DEFAULT_INJECTION_GRACE_MS, DEFAULT_SESSION_TIMEOUT_MS } from "./types.js";
 
 // =============================================================================
-// Background-task wait ceiling
-// =============================================================================
-
-/**
- * Bounds how long the interactive terminal-message branch below will hold a
- * clean result open while a `run_in_background` Agent-tool child is still
- * live, before giving up and closing the session with whatever result it
- * has. Mirrors `claude -p`'s own `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
- * (same env var, same 10min default; `0` disables the wait). `SDKRuntime`
- * doesn't export an equivalent helper on this branch (its own `execute()`
- * bg-wait hold is a sibling fix, not yet present here), so this is a
- * standalone copy rather than a shared import — keep both in sync if either
- * changes.
- */
-const DEFAULT_BG_WAIT_CEILING_MS = 10 * 60_000;
-
-function bgWaitCeilingMs(): number {
-  const raw = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
-  if (raw === undefined || raw === "") return DEFAULT_BG_WAIT_CEILING_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BG_WAIT_CEILING_MS;
-}
-
-// =============================================================================
 // Types
 // =============================================================================
 
@@ -210,6 +186,14 @@ export class JobExecutor {
     // Set when a caller interrupts the run through its session handle — the run
     // is then recorded as cancelled rather than failed.
     let interrupted = false;
+    // Set when the run ends (abort, the sessionTimeoutMs backstop, or a
+    // stream-level error) while a `run_in_background` child was still live per
+    // the last known snapshot — so a killed-mid-work run never reads as a clean
+    // completion from its summary/log line alone (job-2026-08-31-okhjlg: the
+    // old bg-wait ceiling closed a session out from under a live Figma build
+    // and the job recorded "success" with the stale pre-kill summary). Reset
+    // per retry attempt below — reflects only the final attempt's outcome.
+    let endedWithLiveBackgroundTasks = false;
     const sessionTimeoutMs = options.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS;
     const injectionGraceMs = options.injectionGraceMs ?? DEFAULT_INJECTION_GRACE_MS;
     let outputLogPath: string | undefined;
@@ -502,16 +486,15 @@ export class JobExecutor {
       // `run_in_background` child isn't abandoned when its parent turn's
       // terminal result arrives — same signal `SDKRuntime.execute()`'s own
       // bg-wait fix reads. See the terminal-message branch below.
+      //
+      // No ceiling defers to here any more (operator decision after
+      // job-2026-08-31-okhjlg killed a legitimate Figma build mid-work): a
+      // live background task holds the run open unconditionally. The
+      // SessionReaper is the policy for when a session with no *pending job*
+      // holding it should eventually close; this loop just keeps draining for
+      // as long as the child is live, same as the reaper's own "keepAlive
+      // while background work runs, no timer" rule.
       let liveBackgroundTasks: unknown[] = [];
-      let bgWaitTimer: ReturnType<typeof setTimeout> | undefined;
-      let bgWaitCeilingArmed = false;
-
-      const clearBgWaitTimer = (): void => {
-        if (bgWaitTimer) {
-          clearTimeout(bgWaitTimer);
-          bgWaitTimer = undefined;
-        }
-      };
 
       // Bound the wait for the follow-up turn. A host that folded the injected
       // message into the turn that just ended will never produce a second
@@ -522,11 +505,12 @@ export class JobExecutor {
           // A live background task can still be running when this grace
           // window expires (CodeRabbit finding on the vulpes-pack sibling
           // patch, PR #181). Closing here would kill it out from under the
-          // bg-wait ceiling armed alongside it — hold instead; the ceiling
-          // (or a later real terminal) owns teardown from here.
+          // still-live child — hold instead, unconditionally: the drain loop
+          // keeps consuming until the child's own re-invocation produces a
+          // fresh terminal, or the run is aborted/times out.
           if (liveBackgroundTasks.length > 0) {
             this.logger.warn(
-              `Job ${job.id}: injection grace expired but a background task is still live — holding for bg-wait ceiling`,
+              `Job ${job.id}: injection grace expired but a background task is still live — holding, draining for the child's re-invocation`,
             );
             return;
           }
@@ -543,7 +527,6 @@ export class JobExecutor {
       const closeSession = async (): Promise<void> => {
         acceptingInput = false;
         clearGrace();
-        clearBgWaitTimer();
         if (drainTimer) {
           clearTimeout(drainTimer);
           drainTimer = undefined;
@@ -594,10 +577,14 @@ export class JobExecutor {
             // session gets its own and the job's abort is forwarded one-way.
             const sessionAbort = new AbortController();
             const jobSignal = options.abortController?.signal;
-            if (jobSignal?.aborted) {
+            const markIfLiveOnAbort = () => {
+              if (liveBackgroundTasks.length > 0) endedWithLiveBackgroundTasks = true;
               sessionAbort.abort();
+            };
+            if (jobSignal?.aborted) {
+              markIfLiveOnAbort();
             } else {
-              jobSignal?.addEventListener("abort", () => sessionAbort.abort(), { once: true });
+              jobSignal?.addEventListener("abort", markIfLiveOnAbort, { once: true });
             }
 
             const opened = openSession({ ...runtimeOptions, abortController: sessionAbort });
@@ -607,9 +594,13 @@ export class JobExecutor {
             // Stuck-run backstop: the stream never ends by itself, so without
             // this a missing terminal result drains forever and never releases
             // the job's concurrency slot. Closing the session ends the stream,
-            // which is what unblocks the loop below.
+            // which is what unblocks the loop below. Unlike the removed
+            // bg-wait ceiling, this is a much longer (default 2h), unrelated
+            // "genuinely stuck stream" backstop — but it can still fire while a
+            // background task is legitimately live, so mark that truthfully too.
             drainTimer = setTimeout(() => {
               timedOut = true;
+              if (liveBackgroundTasks.length > 0) endedWithLiveBackgroundTasks = true;
               void closeSession();
             }, sessionTimeoutMs);
             drainTimer.unref?.();
@@ -629,6 +620,7 @@ export class JobExecutor {
                 // for this ending. The interrupt's terminal message breaks the
                 // drain loop, so the run really does end here.
                 interrupted = true;
+                if (liveBackgroundTasks.length > 0) endedWithLiveBackgroundTasks = true;
                 void session.interrupt().catch((interruptError) => {
                   this.logger.warn(
                     `Failed to interrupt session: ${(interruptError as Error).message}`,
@@ -639,6 +631,12 @@ export class JobExecutor {
             });
             messages = opened.messages;
           } else {
+            // No session handle on this path, so no local abort listener to
+            // hook a live-tasks check into today — the caller's abortController
+            // goes straight into SDKRuntime.execute() and an abort there throws
+            // out of the for-await below rather than yielding a message.
+            // Truthful-close marking for that case is in the `catch` below,
+            // which reads the same `liveBackgroundTasks` this loop tracks.
             messages = this.runtime.execute(runtimeOptions);
           }
         } catch (initError) {
@@ -771,6 +769,7 @@ export class JobExecutor {
             if (sdkMessage.type === "error") {
               // A stream-level error is always the end — no further turn runs.
               acceptingInput = false;
+              if (liveBackgroundTasks.length > 0) endedWithLiveBackgroundTasks = true;
               const errorMessage = (sdkMessage.message as string) ?? "Agent execution failed";
               lastError = new SDKStreamingError(
                 buildErrorMessage(errorMessage, {
@@ -816,26 +815,6 @@ export class JobExecutor {
               lastError = undefined;
             }
 
-            // Arm the bg-wait ceiling BEFORE considering pendingInjected —
-            // CodeRabbit finding on the vulpes-pack sibling patch, PR #181: a
-            // terminal with BOTH pendingInjected>0 AND a live background task
-            // previously took the pendingInjected branch only, leaving the
-            // ceiling unarmed; if no follow-up turn came, armInjectionGrace's
-            // timeout closed the session anyway and killed the live child.
-            // Arm-once here (bgWaitCeilingArmed guards it) guarantees a
-            // deadline regardless of which branch runs next.
-            if (liveBackgroundTasks.length > 0 && bgWaitCeilingMs() > 0 && !bgWaitCeilingArmed) {
-              bgWaitCeilingArmed = true;
-              const ceiling = bgWaitCeilingMs();
-              bgWaitTimer = setTimeout(() => {
-                this.logger.warn(
-                  `Job ${job.id}: background task still running after ${ceiling}ms ceiling — closing session with the last terminal result`,
-                );
-                void closeSession();
-              }, ceiling);
-              bgWaitTimer.unref?.();
-            }
-
             if (pendingInjected > 0) {
               // Injected input is still queued behind this turn. Hosts differ on
               // when they deliver a pushed streaming-input message: some fold it
@@ -864,12 +843,16 @@ export class JobExecutor {
             // re-evaluated here, at a fresh terminal, not on every message —
             // a `background_tasks_changed` drain to empty is not itself a
             // terminal message.
-            if (liveBackgroundTasks.length > 0 && bgWaitCeilingMs() > 0) {
+            //
+            // Unconditional, no ceiling: keep draining for as long as the
+            // child is live (operator decision after job-2026-08-31-okhjlg —
+            // see the note on `liveBackgroundTasks` above). Only stream
+            // end/abort/timeout exits the loop from here on.
+            if (liveBackgroundTasks.length > 0) {
               continue;
             }
 
             // Nothing pending, no live background tasks: this really is the end.
-            clearBgWaitTimer();
             acceptingInput = false;
             break;
           }
@@ -923,6 +906,7 @@ export class JobExecutor {
           retriedAfterSessionExpiry = true;
           lastError = undefined;
           messagesReceived = 0;
+          endedWithLiveBackgroundTasks = false;
           // Tear the failed session down before the retry opens a new one, so
           // two `claude` processes never run for this job at once.
           await closeSession();
@@ -963,6 +947,7 @@ export class JobExecutor {
           // Retry with a fresh session (no resume)
           retriedAfterSessionExpiry = true;
           messagesReceived = 0; // Reset for fresh session
+          endedWithLiveBackgroundTasks = false;
           // Tear the failed session down before the retry opens a new one, so
           // two `claude` processes never run for this job at once.
           await closeSession();
@@ -992,11 +977,21 @@ export class JobExecutor {
           // Retry — buildContainerEnv() will refresh the token from the credentials file
           retriedAfterTokenExpiry = true;
           messagesReceived = 0;
+          endedWithLiveBackgroundTasks = false;
           // Tear the failed session down before the retry opens a new one, so
           // two `claude` processes never run for this job at once.
           await closeSession();
           await executeWithRetry(undefined);
           return;
+        }
+
+        // An abort on the plain execute() path (no session handle to hook a
+        // listener into, see the `else` branch above) surfaces here as a
+        // thrown error rather than a stream message — the timedOut/graceClosed
+        // cases already mark truthfully at their own throw sites, so only the
+        // generic fallthrough (a genuine abort or unexpected failure) needs it.
+        if (!timedOut && !graceClosed && liveBackgroundTasks.length > 0) {
+          endedWithLiveBackgroundTasks = true;
         }
 
         // Wrap the error with context if not already a RunnerError. A timeout
@@ -1084,6 +1079,22 @@ export class JobExecutor {
     // Note: Truncation is handled by downstream consumers (e.g., Discord hook truncates to 4096)
     if (!summary && lastAssistantContent) {
       summary = lastAssistantContent;
+    }
+
+    // Truthful close (operator decision after job-2026-08-31-okhjlg): the run
+    // ended (abort, the sessionTimeoutMs backstop, or a stream error) while a
+    // background child was still live per the last known snapshot — mark the
+    // summary/log line so it can never read as a clean, complete result on its
+    // own, whatever the job's status field ends up being.
+    if (endedWithLiveBackgroundTasks) {
+      const marker = "background work terminated before completion";
+      summary = summary ? `${summary} [${marker}]` : `[${marker}]`;
+      try {
+        await appendJobOutput(jobsDir, job.id, { type: "system", content: marker });
+      } catch {
+        // Ignore output write failures — the summary marker above is the
+        // load-bearing signal; this is best-effort extra visibility.
+      }
     }
 
     // Step 5: Update job with final status

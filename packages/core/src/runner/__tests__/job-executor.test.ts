@@ -3099,6 +3099,17 @@ describe("JobExecutor injected-input drain (AI-406)", () => {
 // interactive path used by Jira/GitHub jobs: a `run_in_background` Agent-tool
 // child spawned mid-turn must not be abandoned just because the turn's
 // terminal result arrived while the child was still running.
+//
+// Operator decision after job-2026-08-31-okhjlg (2026-08-31): the fixed
+// CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS-based ceiling that used to force-close
+// this hold was removed entirely — it killed a legitimate >10min Figma build
+// mid-work and the job still reported "success" with the stale pre-kill
+// result. This path now holds unconditionally for as long as a background
+// task is live (the SDK re-invokes the session on drain and produces a fresh
+// terminal; only stream end/abort/the sessionTimeoutMs backstop exits the
+// loop). The truthful-close tests below cover the other half of that fix:
+// whenever the run DOES end while work was still live, the summary/log line
+// says so — a killed build can never read as a clean, complete result.
 
 describe("JobExecutor background-task hold (LZS-347)", () => {
   let tempDir: string;
@@ -3112,7 +3123,7 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
-    delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+    vi.useRealTimers();
   });
 
   it("keeps draining past a terminal with a live background task, and the later re-invocation result wins", async () => {
@@ -3170,63 +3181,67 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
     expect(result.summary).toBe("only turn");
   });
 
-  it("closes with the stale terminal result once the bg-wait ceiling elapses", async () => {
-    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "40";
-
-    const warnings: string[] = [];
-    const logger = {
-      ...createMockLogger(),
-      warn: (message: string) => warnings.push(message),
-    };
-
-    // The background task is reported live and never drains — the run must
-    // not hang forever waiting for a re-invocation that never comes.
+  it("holds the interactive run open with NO time limit while a background task stays live", async () => {
+    // Regression for job-2026-08-31-okhjlg: a legitimate long-running build
+    // must never be force-closed just because it outlives some fixed window.
+    // Real timers throughout — this run does real fs I/O (createJob,
+    // appendJobOutput), which fake timers can't fast-forward, and unlike
+    // SDKRuntime.execute()'s one-shot grace this path has NO timer at all
+    // left in its "still live" branch (see job-executor.ts) — a short real
+    // wait is exactly as conclusive as a long one, there is nothing timer-based
+    // for the wait to race against any more.
     const { runtime, state } = createMockSessionRuntime([
       {
         type: "system",
         subtype: "background_tasks_changed",
-        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "long build" }],
       } as unknown as SDKMessage,
       { type: "result", subtype: "success", result: "held result" } as SDKMessage,
+      // Never drains — nothing should time this out on its own.
     ]);
 
-    const executor = new JobExecutor(runtime, { logger });
-    const result = await executor.execute({
-      agent: createTestAgent({ name: "bg-ceiling-agent" }),
-      prompt: "Test prompt",
-      stateDir,
-      interactive: true,
-    });
+    const abortController = new AbortController();
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    let settled = false;
+    const run = executor
+      .execute({
+        agent: createTestAgent({ name: "bg-hold-forever-agent" }),
+        prompt: "Test prompt",
+        stateDir,
+        interactive: true,
+        abortController,
+      })
+      .then((r) => {
+        settled = true;
+        return r;
+      });
 
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(settled).toBe(false);
+    expect(state.closed).toBe(0);
+
+    // Clean up: end the run via abort rather than leaving it dangling.
+    abortController.abort();
+    await run;
     expect(state.closed).toBeGreaterThanOrEqual(1);
-    expect(warnings.some((w) => /background task still running after 40ms ceiling/.test(w))).toBe(
-      true,
-    );
-    // An expected ending, not a failure: the last (stale) result still decides.
-    expect(result.success).toBe(true);
-    expect(result.summary).toBe("held result");
-
-    const job = await getJob(join(stateDir, "jobs"), result.jobId);
-    expect(job?.status).toBe("completed");
   });
 
-  it("does not close on injection-grace expiry while a background task is still live, and the ceiling releases it", async () => {
+  it("does not close on injection-grace expiry while a background task is still live — holds indefinitely, no ceiling to defer to", async () => {
     // Regression for the CodeRabbit finding on the vulpes-pack sibling patch
     // (PR #181): a terminal with BOTH pendingInjected>0 AND a live background
-    // task used to take the pendingInjected branch only, leaving the bg-wait
-    // ceiling unarmed — the injection-grace timer then closed the session on
-    // its own once it expired, killing the still-live child.
-    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "60";
-
+    // task used to take the pendingInjected branch only, leaving the (now
+    // removed) bg-wait ceiling unarmed — the injection-grace timer then
+    // closed the session on its own once it expired, killing the still-live
+    // child. Now there is no ceiling for anything to leave unarmed: the grace
+    // expiry just holds, unconditionally, same as the main terminal-message
+    // branch does.
     const warnings: string[] = [];
     const logger = {
       ...createMockLogger(),
       warn: (message: string) => warnings.push(message),
     };
 
-    // No onSend follow-up and the background task never drains: neither the
-    // injected message nor the child ever produces a second result.
-    const { runtime, state } = createMockSessionRuntime([
+    const { runtime, state, queue } = createMockSessionRuntime([
       {
         type: "system",
         subtype: "background_tasks_changed",
@@ -3236,58 +3251,108 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
     ]);
 
     const executor = new JobExecutor(runtime, { logger });
-    const result = await executor.execute({
-      agent: createTestAgent({ name: "bg-and-injected-agent" }),
-      prompt: "Test prompt",
-      stateDir,
-      interactive: true,
-      injectionGraceMs: 20,
-      onSessionOpen: (handle) => {
-        handle.send("never answered");
-      },
-    });
+    let settled = false;
+    const run = executor
+      .execute({
+        agent: createTestAgent({ name: "bg-and-injected-agent" }),
+        prompt: "Test prompt",
+        stateDir,
+        interactive: true,
+        injectionGraceMs: 20,
+        onSessionOpen: (handle) => {
+          handle.send("never answered");
+        },
+      })
+      .then((r) => {
+        settled = true;
+        return r;
+      });
 
-    // The grace window expired first (20ms < 60ms ceiling) but held instead
+    // The grace window (20ms) expired but the run stayed open — held instead
     // of closing, because the background task was still live.
+    await new Promise((resolve) => setTimeout(resolve, 60));
     expect(
       warnings.some((w) => /injection grace expired but a background task is still live/.test(w)),
     ).toBe(true);
-    // The ceiling — armed alongside pendingInjected, not blocked by it —
-    // is what actually ends the run.
-    expect(warnings.some((w) => /background task still running after 60ms ceiling/.test(w))).toBe(
-      true,
-    );
-    expect(state.closed).toBeGreaterThanOrEqual(1);
-    expect(result.success).toBe(true);
-    expect(result.summary).toBe("held result");
+    expect(settled).toBe(false);
+    expect(state.closed).toBe(0);
 
-    const job = await getJob(join(stateDir, "jobs"), result.jobId);
-    expect(job?.status).toBe("completed");
+    // Now let the child actually finish — the run should still complete
+    // normally on that fresh result, not on the stale held one.
+    queue.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
+    } as unknown as SDKMessage);
+    queue.push({ type: "result", subtype: "success", result: "second turn" } as SDKMessage);
+
+    const result = await run;
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("second turn");
   });
 
-  it("does not hold at all when the ceiling is disabled (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)", async () => {
-    process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
-
-    const { runtime, state } = createMockSessionRuntime([
+  it("marks the job summary when aborted while a background task is still live", async () => {
+    // Truthful-close half of the job-2026-08-31-okhjlg fix: a run that ends
+    // (for any reason) while background work was live must never read as a
+    // clean result from its summary alone.
+    const abortController = new AbortController();
+    const { runtime } = createMockSessionRuntime([
       {
         type: "system",
         subtype: "background_tasks_changed",
-        tasks: [{ task_id: "bg-1", task_type: "agent", description: "child" }],
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
       } as unknown as SDKMessage,
-      { type: "result", subtype: "success", result: "first turn" } as SDKMessage,
+      { type: "result", subtype: "success", result: "held result" } as SDKMessage,
+      // Never drains — the abort below is what ends the run.
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const run = executor.execute({
+      agent: createTestAgent({ name: "abort-under-work-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      abortController,
+      sessionTimeoutMs: 10_000,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    abortController.abort();
+
+    const result = await run;
+    expect(result.success).toBe(false);
+    expect(result.summary).toContain("background work terminated before completion");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("cancelled");
+  });
+
+  it("marks the job summary when the sessionTimeoutMs backstop fires while a background task is still live", async () => {
+    // The much longer (default 2h), unrelated "genuinely stuck stream"
+    // backstop can still fire while a task is legitimately live — it must be
+    // just as truthful about it as an explicit abort.
+    const { runtime } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "bg-1", task_type: "agent", description: "stuck child" }],
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "held result" } as SDKMessage,
     ]);
 
     const executor = new JobExecutor(runtime, { logger: createMockLogger() });
     const result = await executor.execute({
-      agent: createTestAgent({ name: "bg-disabled-agent" }),
+      agent: createTestAgent({ name: "timeout-under-work-agent" }),
       prompt: "Test prompt",
       stateDir,
       interactive: true,
+      sessionTimeoutMs: 30,
     });
 
-    expect(state.opened).toBe(1);
-    expect(state.closed).toBe(1);
-    expect(result.success).toBe(true);
-    expect(result.summary).toBe("first turn");
+    expect(result.success).toBe(false);
+    expect(result.summary).toContain("background work terminated before completion");
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("failed");
   });
 });
