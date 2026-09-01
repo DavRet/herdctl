@@ -3358,6 +3358,181 @@ describe("JobExecutor background-task hold (LZS-347)", () => {
 });
 
 // =============================================================================
+// Undelivered task_notification reinvocation (vulpes-pack#244, job-2026-09-01-yqhqzn)
+// =============================================================================
+//
+// A background task can start AND drain to completion — its `task_notification`
+// included — entirely WITHIN the turn that dispatched it, before that turn's
+// own terminal. The LZS-347 hold above only covers a task still `live` AT the
+// terminal; a task that already finished leaves `liveBackgroundTasks` empty,
+// so the terminal used to be read as a genuine end and the notification's
+// content was silently lost — the model never got a turn to act on it.
+
+describe("JobExecutor undelivered-notification reinvocation (vulpes-pack#244)", () => {
+  let tempDir: string;
+  let stateDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+    stateDir = join(tempDir, ".herdctl");
+    await initStateDirectory({ path: stateDir });
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("re-invokes once when a task_notification lands before its own turn's terminal, and the follow-up turn's result wins", async () => {
+    const { runtime, state, queue } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "wf-1", task_type: "agent", description: "workflow" }],
+      } as unknown as SDKMessage,
+      // The task drains AND its notification lands entirely within this turn,
+      // before the turn's own terminal — the model can't have consumed it.
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as unknown as SDKMessage,
+      {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "wf-1",
+        status: "completed",
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "first turn (unaware)" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const run = executor.execute({
+      agent: createTestAgent({ name: "notif-reinvoke-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 500,
+    });
+
+    // Give the reinvocation grace time to arm, then deliver the follow-up
+    // turn the SDK produces once it reinvokes with the notification as input.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    queue.push({
+      type: "assistant",
+      content: "picked up the notification",
+    } as unknown as SDKMessage);
+    queue.push({
+      type: "result",
+      subtype: "success",
+      result: "second turn (delivered)",
+    } as SDKMessage);
+
+    const result = await run;
+    expect(result.success).toBe(true);
+    // The job's outcome is the follow-up turn, not the stale one held while
+    // the notification was still undelivered.
+    expect(result.summary).toBe("second turn (delivered)");
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("closes cleanly with no loop when the reinvocation grace elapses without a new notification", async () => {
+    const warnings: string[] = [];
+    const logger = {
+      ...createMockLogger(),
+      warn: (message: string) => warnings.push(message),
+    };
+
+    // No further queue pushes: the follow-up turn never actually shows up
+    // (an isolated/irrelevant notification, or the model genuinely had
+    // nothing left to say about it).
+    const { runtime, state } = createMockSessionRuntime([
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as unknown as SDKMessage,
+      {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "wf-1",
+        status: "completed",
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "only turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "notif-no-followup-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 40,
+    });
+
+    expect(
+      warnings.some((w) =>
+        /no follow-up turn within 40ms after an undelivered task_notification/.test(w),
+      ),
+    ).toBe(true);
+    // An expected ending, not a failure: the held result still decides, and
+    // the session closes exactly once — no repeated reinvocation attempts.
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("only turn");
+    expect(state.closed).toBe(1);
+
+    const job = await getJob(join(stateDir, "jobs"), result.jobId);
+    expect(job?.status).toBe("completed");
+  });
+
+  it("does not arm an extra reinvocation when the notification is already delivered by a normal follow-up turn", async () => {
+    const warnings: string[] = [];
+    const logger = {
+      ...createMockLogger(),
+      warn: (message: string) => warnings.push(message),
+    };
+
+    // The notification lands while a DIFFERENT task is still live, so the
+    // existing live-background-task hold (LZS-347) — not the new
+    // notification grace — is what keeps the loop draining. By the time the
+    // follow-up turn's own assistant message arrives, the notification is
+    // already delivered (a new turn started), so the second turn's clean
+    // terminal must not trigger a further, redundant reinvocation attempt.
+    const { runtime, state } = createMockSessionRuntime([
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [{ task_id: "t1" }],
+      } as unknown as SDKMessage,
+      {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "wf-done-early",
+        status: "completed",
+      } as unknown as SDKMessage,
+      { type: "result", subtype: "success", result: "first turn" } as SDKMessage,
+      { type: "system", subtype: "background_tasks_changed", tasks: [] } as unknown as SDKMessage,
+      { type: "assistant", content: "wrapping up" },
+      { type: "result", subtype: "success", result: "second turn" } as SDKMessage,
+    ]);
+
+    const executor = new JobExecutor(runtime, { logger });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "notif-already-delivered-agent" }),
+      prompt: "Test prompt",
+      stateDir,
+      interactive: true,
+      injectionGraceMs: 30,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("second turn");
+    expect(state.opened).toBe(1);
+    expect(state.closed).toBe(1);
+    // No notification-reinvocation grace was ever needed — the whole run
+    // resolved off the preloaded queue, no grace timer had to fire.
+    expect(
+      warnings.some((w) => /notification-reinvocation|undelivered task_notification/.test(w)),
+    ).toBe(false);
+  });
+});
+
+// =============================================================================
 // Empty-resume retry and dirty-marking (vulpes-pack#206, job-w11ho7)
 // =============================================================================
 //

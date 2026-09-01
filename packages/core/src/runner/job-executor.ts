@@ -515,10 +515,38 @@ export class JobExecutor {
       // situation, not the stale-task_notification bug) is left alone.
       let sawTerminalMessage = false;
 
+      // vulpes-pack#244 (job-2026-09-01-yqhqzn): a background task can start
+      // AND drain to completion — with its `task_notification` delivered on
+      // the stream — entirely WITHIN the turn that dispatched it, before that
+      // turn's own terminal. The existing `liveBackgroundTasks.length > 0`
+      // hold above only covers a task still running AT the terminal; a task
+      // that already finished has nothing to hold on, so the terminal was
+      // read as a genuine end and the notification's content was silently
+      // lost. Track whether the model has had a fresh turn to actually see a
+      // notification: set on `task_notification`, cleared the moment any
+      // follow-up turn actually starts (see `awaitingFollowUpTurn` below) —
+      // that turn gets it as input, whether or not the model acts on it.
+      // One reinvocation attempt per undelivered batch falls out of this same
+      // boolean, no separate counter needed: the terminal-check branch below
+      // that consults it can only ever run once per undelivered batch — the
+      // very next message (any type, including a redundant terminal) resets
+      // it back to false via `awaitingFollowUpTurn` BEFORE that branch is
+      // reached again, so a model that keeps ending turns without consuming
+      // it falls through to the real end instead of looping.
+      let notificationUndelivered = false;
+      // Set right before any `continue` that holds the drain loop open past a
+      // terminal, waiting for the SDK to reinvoke with a follow-up turn —
+      // covers all three hold reasons (injected input, a live background
+      // task, and the notification-reinvocation grace below). The NEXT
+      // message received, whatever it is, is that follow-up turn starting.
+      let awaitingFollowUpTurn = false;
+
       // Bound the wait for the follow-up turn. A host that folded the injected
       // message into the turn that just ended will never produce a second
       // result, so without this the run would idle until sessionTimeoutMs.
-      const armInjectionGrace = (): void => {
+      // `kind` only changes the log wording — the injected-input case keeps
+      // its original phrasing verbatim (tests match on it).
+      const armFollowUpGrace = (kind: "injected input" | "notification"): void => {
         clearGrace();
         graceTimer = setTimeout(() => {
           // A live background task can still be running when this grace
@@ -529,19 +557,25 @@ export class JobExecutor {
           // fresh terminal, or the run is aborted/times out.
           if (liveBackgroundTasks.length > 0) {
             this.logger.warn(
-              `Job ${job.id}: injection grace expired but a background task is still live — holding, draining for the child's re-invocation`,
+              kind === "injected input"
+                ? `Job ${job.id}: injection grace expired but a background task is still live — holding, draining for the child's re-invocation`
+                : `Job ${job.id}: notification-reinvocation grace expired but a background task is still live — holding, draining for the child's re-invocation`,
             );
             return;
           }
           graceClosed = true;
           acceptingInput = false;
           this.logger.warn(
-            `Job ${job.id}: no follow-up turn within ${injectionGraceMs}ms after injected input — closing session (the message may have been folded into the previous turn)`,
+            kind === "injected input"
+              ? `Job ${job.id}: no follow-up turn within ${injectionGraceMs}ms after injected input — closing session (the message may have been folded into the previous turn)`
+              : `Job ${job.id}: no follow-up turn within ${injectionGraceMs}ms after an undelivered task_notification — closing session (the model's turn ended before it could act on the notification)`,
           );
           void closeSession();
         }, injectionGraceMs);
         graceTimer.unref?.();
       };
+      const armInjectionGrace = (): void => armFollowUpGrace("injected input");
+      const armNotificationGrace = (): void => armFollowUpGrace("notification");
 
       const closeSession = async (): Promise<void> => {
         acceptingInput = false;
@@ -693,6 +727,18 @@ export class JobExecutor {
           // The follow-up turn is producing output — stop counting down.
           clearGrace();
 
+          // Whatever this message is, it's the first one to arrive since a
+          // terminal-message branch below chose to hold for a follow-up turn
+          // — that turn now has any previously-undelivered notification as
+          // input, whether or not it acts on it (vulpes-pack#244). Reset
+          // before this message's own type is inspected, so a task_notification
+          // that itself is what unblocks the hold below still starts a fresh
+          // undelivered batch of its own.
+          if (awaitingFollowUpTurn) {
+            awaitingFollowUpTurn = false;
+            notificationUndelivered = false;
+          }
+
           // Track live background tasks off the raw message (REPLACE
           // semantics per the SDK's payload) so the terminal-message branch
           // below knows whether a `run_in_background` child is still running.
@@ -702,6 +748,19 @@ export class JobExecutor {
             (sdkMessage as { subtype?: string }).subtype === "background_tasks_changed"
           ) {
             liveBackgroundTasks = (sdkMessage as { tasks?: unknown[] }).tasks ?? [];
+          }
+
+          // A background task can finish (and report its `task_notification`)
+          // entirely within the turn that dispatched it, before that turn's
+          // own terminal — the model, already mid-generation, cannot have
+          // consumed it. Marks the batch undelivered until a follow-up turn
+          // actually starts (reset above).
+          if (
+            sdkMessage &&
+            (sdkMessage as { type?: string }).type === "system" &&
+            (sdkMessage as { subtype?: string }).subtype === "task_notification"
+          ) {
+            notificationUndelivered = true;
           }
 
           if (sdkMessage && (sdkMessage as { type?: string }).type === "assistant") {
@@ -869,6 +928,7 @@ export class JobExecutor {
               // covers every message queued so far; anything injected during that
               // turn raises the counter again and earns another.
               pendingInjected = 0;
+              awaitingFollowUpTurn = true;
               armInjectionGrace();
               continue;
             }
@@ -888,10 +948,23 @@ export class JobExecutor {
             // see the note on `liveBackgroundTasks` above). Only stream
             // end/abort/timeout exits the loop from here on.
             if (liveBackgroundTasks.length > 0) {
+              awaitingFollowUpTurn = true;
               continue;
             }
 
-            // Nothing pending, no live background tasks: this really is the end.
+            // vulpes-pack#244: a task's `task_notification` landed while this
+            // turn was still generating, so this turn's own terminal can't be
+            // proof the model ever saw it — give the SDK one bounded grace
+            // window to reinvoke with it as input (same mechanism as the
+            // live-task hold above, just for a task that already finished).
+            if (notificationUndelivered) {
+              awaitingFollowUpTurn = true;
+              armNotificationGrace();
+              continue;
+            }
+
+            // Nothing pending, no live background tasks, no undelivered
+            // notification left to wait on: this really is the end.
             acceptingInput = false;
             break;
           }
