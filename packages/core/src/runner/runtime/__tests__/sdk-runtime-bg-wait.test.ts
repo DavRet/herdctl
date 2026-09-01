@@ -867,6 +867,103 @@ describe("SDKRuntime.execute() review follow-up (2 blockers + 1 major)", () => {
   });
 });
 
+// vulpes-pack#244, job-2026-09-01-yqhqzn: a task that starts AND fully drains
+// (its `task_notification` included) entirely WITHIN the turn that dispatched
+// it — before that turn's own terminal — used to only earn the short
+// `raceSettleMs()` ordering-race sniff (meant for a task still possibly in
+// flight), nowhere near enough time for the SDK to actually reinvoke with a
+// real follow-up turn. `justDrained` now wins over the `isFreshTerminal`
+// settle branch, so an already-OBSERVED drain-to-empty always gets the full
+// `DEFAULT_REINVOCATION_GRACE_MS` window, terminal or not.
+describe("SDKRuntime.execute() vulpes-pack#244 (task drains before its own dispatching turn's terminal)", () => {
+  it("grants the full reinvocation grace, not the short settle, when the task already drained before its own terminal", async () => {
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+
+    // The task starts, drains to empty, and its notification lands — all
+    // before this (first-ever) turn's own terminal arrives.
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "wf-1" }],
+    });
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    stream.push({ type: "system", subtype: "task_notification", task_id: "wf-1" });
+    await flushMicrotasks();
+
+    stream.push({
+      type: "result",
+      subtype: "success",
+      result: "first turn (unaware)",
+    } as FakeMessage);
+    await flushMicrotasks();
+    expect(seen.some((m) => m.type === "result")).toBe(false); // held, grace armed
+
+    // A short settle would have released by now — the long grace must not.
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS * 2);
+    expect(seen.some((m) => m.type === "result")).toBe(false);
+
+    // Advancing the rest of the long reinvocation window with nothing else
+    // arriving releases the (only) held terminal.
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("first turn (unaware)");
+    expect(stream.isClosed()).toBe(true);
+  });
+
+  it("delivers the follow-up turn's own fresh result when it arrives within the long grace window", async () => {
+    const runtime = new SDKRuntime();
+    const seen: FakeMessage[] = [];
+    const drain = (async () => {
+      for await (const message of runtime.execute(baseOptions())) {
+        seen.push(message);
+      }
+    })();
+
+    await flushMicrotasks();
+    const stream = activeStream!;
+
+    stream.push({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "wf-1" }],
+    });
+    stream.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    stream.push({ type: "system", subtype: "task_notification", task_id: "wf-1" });
+    await flushMicrotasks();
+
+    stream.push({
+      type: "result",
+      subtype: "success",
+      result: "first turn (unaware)",
+    } as FakeMessage);
+    await flushMicrotasks();
+
+    // Well within the (long) grace window, the reinvocation shows up.
+    await vi.advanceTimersByTimeAsync(DEFAULT_REINVOCATION_GRACE_MS / 2);
+    stream.push({ type: "assistant", message: { content: [] } });
+    stream.push({ type: "result", subtype: "success", result: "second turn (delivered)" });
+    await vi.advanceTimersByTimeAsync(RACE_SETTLE_MS);
+    await drain;
+
+    const results = seen.filter((m) => m.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0].result).toBe("second turn (delivered)");
+    expect(stream.isClosed()).toBe(true);
+  });
+});
+
 // Verify round on the fixes above (vulpes-pack#206) found 4 confirmed majors
 // + 2 minors, 0 refuted — every finding survived adversarial check. Fix
 // round 2, all in sdk-runtime.ts.

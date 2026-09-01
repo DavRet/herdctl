@@ -595,6 +595,25 @@ export class SDKRuntime implements RuntimeInterface {
         if (pendingTerminal) {
           if (liveBackgroundTasks.length > 0) {
             // Still (or newly) live — nothing to arm; already cleared above.
+          } else if (justDrained) {
+            // A genuine drain-to-empty transition has been OBSERVED (this
+            // message, or an earlier one) — strictly more conclusive than the
+            // ordering-race guess below, so it wins regardless of whether the
+            // CURRENT message is itself a fresh terminal. Checked ahead of the
+            // `isFreshTerminal` race-settle branch (vulpes-pack#244,
+            // job-2026-09-01-yqhqzn): a task that starts AND fully drains
+            // (its `task_notification` included) entirely WITHIN the turn
+            // that dispatched it — before that turn's own terminal — used to
+            // fall through to the terminal-message branch below instead, which
+            // only grants the short `raceSettleMs()` sniff meant for a task
+            // still possibly in flight. That's nowhere near enough time for
+            // the SDK to actually schedule and stream a real follow-up turn
+            // feeding the notification back to the model, so the reinvocation
+            // never happened and the notification's result was silently lost.
+            // A real drain-to-empty deserves the full reinvocation window
+            // every time, terminal or not.
+            justDrained = false;
+            armGrace(DEFAULT_REINVOCATION_GRACE_MS);
           } else if (isFreshTerminal && (sawBackgroundActivity || isFirstTerminal)) {
             // Ordering race: a background task dispatched IN this terminal
             // turn can lose the wire race against the turn's own terminal
@@ -612,20 +631,16 @@ export class SDKRuntime implements RuntimeInterface {
             // no prior activity to gate on and IS the shape of the original
             // prod incident (job-w11ho7) this whole effort started from. Only
             // a SECOND-and-later terminal in a run that has genuinely never
-            // touched background work skips the tail.
+            // touched background work skips the tail. (`justDrained` is
+            // always false here — otherwise the branch above would have won.)
             armGrace(raceSettleMs());
           } else if (isFreshTerminal) {
-            // Second-and-later terminal, never touched background work:
-            // nothing to wait for — the v2 immediate release, no tail.
+            // Second-and-later terminal, never touched background work (and
+            // no pending drain): nothing to wait for — the v2 immediate
+            // release, no tail.
             clearGrace();
             clearMaxHold();
             break;
-          } else if (justDrained) {
-            // A genuine drain-to-empty transition, not itself a terminal:
-            // give a follow-up turn a real chance to show up before giving
-            // up on it.
-            justDrained = false;
-            armGrace(DEFAULT_REINVOCATION_GRACE_MS);
           } else {
             // Nothing live, no fresh transition: a redundant or unrelated
             // message (a duplicate 0-task report, stray content) arrived
