@@ -758,10 +758,22 @@ export class DiscordManager implements IChatManager {
       // WRITE at the end of every turn (regardless of resume) always persisted
       // into that same shared <agent.qualifiedName>.json file, poisoning it
       // for the next unrelated gh-inbox/schedule dispatch.
+      //
+      // `?? null` makes the no-existing-session case explicit ("start fresh"),
+      // not just "unset" — trigger()'s own resume semantics treat undefined as
+      // "fall back to the agent-level session lookup" and null as "skip that
+      // fallback" (job-control.ts). sessionKey alone only fixes the WRITE; a
+      // channel with no per-channel session yet would otherwise still resume
+      // whatever the agent-level default currently points to, which for
+      // Discord specifically also matters for /reset and /new: those clear
+      // only the chat-side channel->sessionId record, never the core pointer
+      // (no non-test caller clears it), so the very next message with
+      // `resume: existingSessionId` (undefined) would silently re-adopt the
+      // conversation the user just asked to clear.
       const result = await this.ctx.trigger(qualifiedName, undefined, {
         triggerType: "discord",
         prompt,
-        resume: existingSessionId,
+        resume: existingSessionId ?? null,
         sessionKey: `${qualifiedName}--discord-${event.metadata.channelId}`,
         injectedMcpServers,
         onJobCreated: async (jobId) => {
