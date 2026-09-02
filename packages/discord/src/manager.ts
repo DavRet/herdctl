@@ -751,10 +751,18 @@ export class DiscordManager implements IChatManager {
       // Execute job via FleetManager.trigger() through the context
       // Pass resume option for conversation continuity
       // The onMessage callback streams output incrementally to Discord
+      // sessionKey scopes this run's read+write to the channel (vulpes-pack#355)
+      // — without it, `resume` only fixed the READ for a channel that already
+      // has a session; a channel's first-ever message (existingSessionId still
+      // undefined) fell through to trigger()'s agent-level default, and the
+      // WRITE at the end of every turn (regardless of resume) always persisted
+      // into that same shared <agent.qualifiedName>.json file, poisoning it
+      // for the next unrelated gh-inbox/schedule dispatch.
       const result = await this.ctx.trigger(qualifiedName, undefined, {
         triggerType: "discord",
         prompt,
         resume: existingSessionId,
+        sessionKey: `${qualifiedName}--discord-${event.metadata.channelId}`,
         injectedMcpServers,
         onJobCreated: async (jobId) => {
           this.activeJobsByChannel.set(

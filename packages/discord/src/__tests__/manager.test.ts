@@ -1187,6 +1187,34 @@ describe("DiscordManager handleMessage pipeline", () => {
     return { event, reply: replyFn, replyWithRef: replyWithRefFn };
   }
 
+  // ---- session isolation (vulpes-pack#355) ----
+
+  it("scopes ctx.trigger() with a per-channel sessionKey, not just resume", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { sessionKey?: string; resume?: string | null };
+    // Without sessionKey, the WRITE at the end of this run would land in the
+    // shared <agent.qualifiedName>.json file regardless of `resume` — see #355.
+    expect(options.sessionKey).toBe("test-agent--discord-channel1");
+  });
+
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
 
   it("suppresses reasoning turns (text + tool_use) in 'answers' mode", async () => {
