@@ -127,6 +127,18 @@ export class ScheduleExecutor {
           stateDir,
           triggerType: "schedule",
           schedule: scheduleName,
+          // sessionKey scopes this run's read+write to the schedule (vulpes-pack#355):
+          // without it every schedule run falls back to JobExecutor's default
+          // `agent.qualifiedName` session, so self-sync/brain-sync/jira-triage/
+          // support-inbox all shared (and clobbered) the same pointer file. This
+          // is the live path — FleetManager wires schedule triggers straight to
+          // ScheduleExecutor.executeSchedule; the sibling fix in
+          // scheduler/schedule-runner.ts's runSchedule() is unreachable dead code
+          // (no production caller). Same key shape schedule-runner.ts already
+          // uses, so a schedule's own runs keep chaining across triggers while
+          // staying isolated from other lanes (Discord channels, other schedules,
+          // ad-hoc triggers on the same agent).
+          sessionKey: `${agent.qualifiedName}--schedule--${scheduleName}`,
           outputToFile: schedule.outputToFile ?? false,
           onJobCreated: (id: string, job: JobMetadata) => {
             // Set jobId early so onMessage can emit events during execution.
