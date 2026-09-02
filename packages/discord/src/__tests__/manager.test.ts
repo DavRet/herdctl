@@ -1213,6 +1213,14 @@ describe("DiscordManager handleMessage pipeline", () => {
     // Without sessionKey, the WRITE at the end of this run would land in the
     // shared <agent.qualifiedName>.json file regardless of `resume` — see #355.
     expect(options.sessionKey).toBe("test-agent--discord-channel1");
+    // No per-channel session exists yet, so resume must be explicit `null`
+    // ("start fresh", skips trigger()'s agent-level fallback lookup) rather
+    // than `undefined` ("fall back to the agent-level session") — otherwise
+    // sessionKey fixes only the WRITE and this channel's first-ever message
+    // (and post-/reset or post-/new messages, since neither command clears
+    // the core session pointer) would still silently resume whatever the
+    // shared default currently points to.
+    expect(options.resume).toBeNull();
   });
 
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
