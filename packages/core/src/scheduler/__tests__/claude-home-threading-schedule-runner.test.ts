@@ -77,7 +77,10 @@ describe("runSchedule resolves the resumed CLI session against the configured ho
     stateDir = path.join(tempRoot, ".herdctl");
     sessionsDir = path.join(stateDir, "sessions");
     workDir = path.join(tempRoot, "workspace");
-    pointerFile = path.join(sessionsDir, `${AGENT}.json`);
+    // Schedule runs with no work item are keyed by schedule name, not the bare
+    // agent name (vulpes-pack#355) — matches the "hourly" scheduleName used
+    // by every runSchedule() call below.
+    pointerFile = path.join(sessionsDir, `${AGENT}--schedule--hourly.json`);
 
     await mkdir(path.join(stateDir, "jobs"), { recursive: true });
     await mkdir(sessionsDir, { recursive: true });

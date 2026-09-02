@@ -1,7 +1,13 @@
 /**
  * Per-work-item sessions: a schedule run that processes a work item stores its
  * session under a key derived from that item, so two items never share (and
- * pollute) one conversation. Runs without a work item keep the agent-level key.
+ * pollute) one conversation. Runs without a work item are scoped per schedule
+ * name instead of the bare agent-level key (vulpes-pack#355) — otherwise a
+ * plain interval/cron schedule (self-sync, brain-sync, ...) writes its fresh
+ * session_id into the same shared <agent.qualifiedName>.json file every other
+ * unscoped trigger() caller (gh-inbox, Discord's first channel message) also
+ * reads from, so the schedule run becomes an accidental donor session for an
+ * unrelated dispatch to adopt.
  */
 
 import { mkdir, readdir, realpath, rm } from "node:fs/promises";
@@ -111,7 +117,7 @@ describe("runSchedule session key", () => {
     expect(await sessionFiles(stateDir)).toEqual(["worker--AI-101.json", "worker--AI-102.json"]);
   });
 
-  it("keeps the agent-level session when there is no work item", async () => {
+  it("scopes the session per schedule name when there is no work item (#355)", async () => {
     const result = await runSchedule({
       agent,
       scheduleName: "hourly",
@@ -123,6 +129,26 @@ describe("runSchedule session key", () => {
     } as any);
 
     expect(result.success).toBe(true);
-    expect(await sessionFiles(stateDir)).toEqual(["worker.json"]);
+    expect(await sessionFiles(stateDir)).toEqual(["worker--schedule--hourly.json"]);
+  });
+
+  it("keeps two differently-named no-work-item schedules isolated from each other (#355)", async () => {
+    for (const scheduleName of ["self-sync", "brain-sync"]) {
+      const result = await runSchedule({
+        agent,
+        scheduleName,
+        schedule,
+        stateDir,
+        workSourceManager: managerFor(null),
+        logger: silentLogger,
+        // biome-ignore lint/suspicious/noExplicitAny: RunScheduleOptions extras are irrelevant here
+      } as any);
+      expect(result.success).toBe(true);
+    }
+
+    expect(await sessionFiles(stateDir)).toEqual([
+      "worker--schedule--brain-sync.json",
+      "worker--schedule--self-sync.json",
+    ]);
   });
 });

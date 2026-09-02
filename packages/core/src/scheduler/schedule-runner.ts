@@ -295,11 +295,16 @@ export async function runSchedule(options: RunScheduleOptions): Promise<Schedule
 
     // Per-work-item session: when this run is processing a work item, scope the
     // session to that item instead of the agent, so two items never share (and
-    // pollute) one conversation. Without a work item the key stays the agent's
-    // qualified name, i.e. behavior is unchanged.
+    // pollute) one conversation. Without a work item, scope by schedule name
+    // instead of falling back to the bare agent qualifiedName (vulpes-pack#355)
+    // — a plain interval/cron schedule (self-sync, brain-sync, ...) with no
+    // work item used to write its fresh session_id into the same shared
+    // <agent.qualifiedName>.json file every unscoped trigger() caller reads
+    // from, so a schedule run became an accidental donor session for the
+    // next unrelated gh-inbox/Discord dispatch to adopt.
     const sessionKey = workItem
       ? toSafeIdentifier(`${agent.qualifiedName}--${workItem.id}`)
-      : agent.qualifiedName;
+      : toSafeIdentifier(`${agent.qualifiedName}--schedule--${scheduleName}`);
 
     // Step 3: Build the prompt
     const prompt = buildSchedulePrompt(schedule, workItem);
